@@ -157,10 +157,10 @@ async function renderCustomerDetails(id, focusEdit) {
       </div>
     </div>` : ''}
     <div class="detail-actions">
-      <button class="btn btn-primary btn-sm w-full" onclick="saveCustomerEdits(${id})">保存修改</button>
+      <button class="btn btn-primary btn-sm w-full" onclick="saveCustomerEdits(${id}, this)">保存修改</button>
       <button class="btn btn-outline btn-sm w-full" onclick="closeSidebar()">取消</button>
-      <button class="btn btn-outline btn-sm w-full" onclick="navigate('conversations');setTimeout(()=>selectCustomer(${id}),200)">查看对话</button>
-      <button class="btn btn-danger btn-sm w-full" onclick="toggleCustomerStatus(${id},'${c.status==='active'?'inactive':'active'}',${fs?fs.id:0})">${c.status==='active'?'暂停跟进':'恢复跟进'}</button>
+      <button class="btn btn-outline btn-sm w-full" onclick="closeSidebar();openConversation(${id})">查看对话</button>
+      <button class="btn btn-danger btn-sm w-full" onclick="toggleCustomerStatus(${id},'${c.status==='active'?'inactive':'active'}',${fs?fs.id:0}, this)">${c.status==='active'?'暂停跟进':'恢复跟进'}</button>
     </div>
     </div>`);
 
@@ -201,14 +201,16 @@ async function renderCustomerDetails(id, focusEdit) {
   }
 
   // Add create order button
-  const createOrderBtn = `<button class="btn btn-outline btn-sm w-full" onclick="closeSidebar();navigate('orders');setTimeout(()=>openOrderForm(null,${id}),300)" style="margin-top:6px">+ 创建订单</button>`;
+  const createOrderBtn = `<button class="btn btn-outline btn-sm w-full" onclick="closeSidebar();openOrderForm(null,${id})" style="margin-top:6px">+ 创建订单</button>`;
   document.querySelector('.detail-actions').insertAdjacentHTML('beforeend', createOrderBtn);
   if (focusEdit) setTimeout(() => { const input = document.getElementById('edit-company'); if (input) input.focus(); }, 60);
 }
 
-async function toggleCustomerStatus(id, newStatus, scheduleId) {
-  try { await applyCustomerStatus(id, newStatus, scheduleId); }
-  catch (error) { uiAlert('更新客户状态失败：' + (error.message || String(error))); }
+async function toggleCustomerStatus(id, newStatus, scheduleId, btn) {
+  await withButtonLock(btn, async () => {
+    try { await applyCustomerStatus(id, newStatus, scheduleId); }
+    catch (error) { uiAlert('更新客户状态失败：' + (error.message || String(error))); }
+  });
 }
 
 async function applyCustomerStatus(id, newStatus, scheduleId) {
@@ -222,23 +224,25 @@ async function applyCustomerStatus(id, newStatus, scheduleId) {
 	  else if (currentPage === 'conversations') loadPage('conversations');
 	}
 
-async function saveCustomerEdits(id) {
-  const name = document.getElementById('edit-name')?.value?.trim() || '';
-  const phone = document.getElementById('edit-phone')?.value?.trim() || '';
-  const company = document.getElementById('edit-company')?.value?.trim() || '';
-  const notes = document.getElementById('edit-notes')?.value?.trim() || '';
-  const tags = document.getElementById('edit-tags')?.value?.trim() || '';
-  try {
-    const r = await post(`/customers/${id}/status`, {name, phone, company, notes, tags});
-    if (r.ok) {
-      closeSidebar();
-      if (currentPage === 'customers') loadPage('customers');
-      else if (currentPage === 'conversations') loadPage('conversations');
-    } else {
-      uiAlert('保存失败：' + (r.error || '未知错误'));
+async function saveCustomerEdits(id, btn) {
+  await withButtonLock(btn, async () => {
+    const name = document.getElementById('edit-name')?.value?.trim() || '';
+    const phone = document.getElementById('edit-phone')?.value?.trim() || '';
+    const company = document.getElementById('edit-company')?.value?.trim() || '';
+    const notes = document.getElementById('edit-notes')?.value?.trim() || '';
+    const tags = document.getElementById('edit-tags')?.value?.trim() || '';
+    try {
+      const r = await post(`/customers/${id}/status`, {name, phone, company, notes, tags});
+      if (r.ok) {
+        closeSidebar();
+        if (currentPage === 'customers') loadPage('customers');
+        else if (currentPage === 'conversations') loadPage('conversations');
+      } else {
+        uiAlert('保存失败：' + (r.error || '未知错误'));
+      }
+    } catch(e) {
+      uiAlert('保存失败: ' + (e.message || '网络错误，请检查后端是否正常运行'));
     }
-  } catch(e) {
-    uiAlert('保存失败: ' + (e.message || '网络错误，请检查后端是否正常运行'));
-  }
+  });
 }
 

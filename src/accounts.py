@@ -60,8 +60,9 @@ def get_conn() -> sqlite3.Connection:
         if _conn is None:
             path = _db_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(path), check_same_thread=False)
+            conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000;")
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.executescript(_SCHEMA)
@@ -176,6 +177,25 @@ def list_users() -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def update_password(email: str, new_password: str) -> bool:
+    """Update password hash for an existing user and revoke active sessions."""
+    normalized = _normalize_email(email)
+    pwd_hash = hash_password(new_password)
+    conn = get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE users SET password_hash=? WHERE email=?",
+            (pwd_hash, normalized),
+        )
+        if cur.rowcount == 0:
+            return False
+        row = conn.execute("SELECT id FROM users WHERE email=?", (normalized,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+        conn.commit()
+    return True
+
+
 def authenticate(email: str, password: str) -> Optional[Dict]:
     user = get_user_by_email(email)
     if not user or user["status"] != "active":
@@ -215,7 +235,7 @@ def resolve_session(token: str) -> Optional[Dict]:
     conn = get_conn()
     with _lock:
         row = conn.execute(
-            "SELECT s.token_hash, s.user_id, s.expires_at, u.email, u.data_dir, u.status"
+            "SELECT s.token_hash, s.user_id, s.expires_at, s.last_seen, u.email, u.data_dir, u.status"
             " FROM sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token_hash=?",
             (_hash_token(token),),
@@ -233,16 +253,24 @@ def resolve_session(token: str) -> Optional[Dict]:
             conn.execute("DELETE FROM sessions WHERE token_hash=?", (row["token_hash"],))
             conn.commit()
             return None
-        # 滑动续期：剩余不足一半时延长
+        # 滑动续期：剩余不足一半时延长；平时节流更新 last_seen（超过 60s 才写库，避免每请求写盘）
         if expires - now < timedelta(days=SESSION_TTL_DAYS // 2):
             new_exp = (now + timedelta(days=SESSION_TTL_DAYS)).isoformat(timespec="seconds")
             conn.execute("UPDATE sessions SET last_seen=?, expires_at=? WHERE token_hash=?",
                          (now.isoformat(timespec="seconds"), new_exp, row["token_hash"]))
             conn.commit()
         else:
-            conn.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?",
-                         (now.isoformat(timespec="seconds"), row["token_hash"]))
-            conn.commit()
+            should_touch = True
+            if row["last_seen"]:
+                try:
+                    last_seen_dt = datetime.fromisoformat(row["last_seen"])
+                    should_touch = (now - last_seen_dt) >= timedelta(seconds=60)
+                except ValueError:
+                    should_touch = True
+            if should_touch:
+                conn.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?",
+                             (now.isoformat(timespec="seconds"), row["token_hash"]))
+                conn.commit()
     return {"user_id": row["user_id"], "email": row["email"],
             "data_dir": row["data_dir"]}
 

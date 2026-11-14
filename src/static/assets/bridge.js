@@ -10,13 +10,20 @@ function loadQrCodeLib() {
   return Promise.resolve(qrcodeLoaded);
 }
 
+let qrPollInFlight = false;
+let qrPollFailures = 0;
+
 async function startQrPolling() {
   if (qrPollTimer) return;
   await loadQrCodeLib();
   qrWaitStarted = Date.now();
+  qrPollFailures = 0;
   qrPollTimer = setInterval(async () => {
+    if (document.hidden || qrPollInFlight) return;
+    qrPollInFlight = true;
     try {
       const r = await get('/qr');
+      qrPollFailures = 0;
       const qrDiv = document.getElementById('qr-area');
       if (!qrDiv) { clearInterval(qrPollTimer); qrPollTimer = null; return; }
       if (r.status === 'pending' && r.qr_text) {
@@ -50,31 +57,40 @@ async function startQrPolling() {
           const btn = document.getElementById('qr-toggle-btn');
           if (btn) { btn.textContent = '刷新状态'; btn.disabled = true; }
           clearInterval(qrPollTimer); qrPollTimer = null;
-          setTimeout(() => loadBridge(document.getElementById('page-bridge')), 2000);
+          setTimeout(() => loadPage('bridge'), 2000);
         }
       }
     } catch(e) {
+      qrPollFailures++;
       const qrDiv = document.getElementById('qr-area');
-      if (qrDiv) qrDiv.textContent = '读取二维码失败，请隐藏后重新打开：' + e.message;
-      clearInterval(qrPollTimer); qrPollTimer = null;
+      const hint = qrDiv && qrDiv.querySelector('.qr-hint');
+      if (hint) hint.textContent = `读取二维码暂时失败（第 ${qrPollFailures} 次），正在自动重试…`;
+      else if (qrDiv && qrPollFailures >= 3) qrDiv.textContent = '读取二维码失败，请稍候或隐藏后重新打开：' + e.message;
+    } finally {
+      qrPollInFlight = false;
     }
   }, 3000);
 }
 
-async function restartBridge() {
+async function restartBridge(btn) {
   const hint = document.getElementById('bridge-start-hint');
-  try {
-    await post('/bridge/stop', {});
-    await new Promise(r => setTimeout(r, 900));
-    const r = await post('/bridge/start', {});
-    if (r && r.ok === false) {
-      alert('重启失败：' + (r.error || '未知错误'));
-      return;
+  await withButtonLock(btn, async () => {
+    const oldHtml = btn ? btn.innerHTML : '';
+    if (btn) btn.textContent = '正在重启…';
+    try {
+      const r = await post('/bridge/restart', {}, 45000);
+      if (r && r.ok === false) {
+        await uiAlert('重启失败：' + (r.error || '未知错误'));
+        return;
+      }
+      await loadPage('bridge');
+    } catch (e) {
+      if (hint) hint.textContent = '重启失败：' + (e && e.message ? e.message : e);
+      else await uiAlert('重启失败：' + (e && e.message ? e.message : e));
+    } finally {
+      if (btn && btn.isConnected) btn.innerHTML = oldHtml;
     }
-    await loadPage('bridge');
-  } catch (e) {
-    if (hint) hint.textContent = '重启失败：' + (e && e.message ? e.message : e);
-  }
+  });
 }
 
 function toggleQr() {

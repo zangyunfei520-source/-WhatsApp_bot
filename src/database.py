@@ -232,9 +232,22 @@ def _migrate_followup_sending_claim(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE follow_up_schedule ADD COLUMN sending_since TIMESTAMP")
 
 
+def _migrate_conversation_composite_indexes(conn: sqlite3.Connection) -> None:
+    """Add composite indexes used by workspace projections and reply-state lookups."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_cust_sent_id "
+        "ON conversations(customer_id, sent_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_cust_dir_status "
+        "ON conversations(customer_id, direction, status, sent_at DESC, id DESC)"
+    )
+
+
 MIGRATIONS = [
     (1, "conversation_delivery_status", _migrate_conversation_delivery),
     (2, "followup_sending_claim", _migrate_followup_sending_claim),
+    (3, "conversation_composite_indexes", _migrate_conversation_composite_indexes),
 ]
 
 

@@ -221,7 +221,7 @@ async function selectCustomer(id) {
   }
   let refreshing = false, ticks = 0;
   convPollTimer = setInterval(async () => {
-    if (gen !== convPollGeneration || currentPage !== 'conversations') return;
+    if (document.hidden || gen !== convPollGeneration || currentPage !== 'conversations') return;
     if (refreshing) return;
     refreshing = true;
     try {
@@ -236,16 +236,27 @@ async function selectCustomer(id) {
     } finally { refreshing = false; }
   }, 5000);
 }
+function conversationMessagesSig(items) {
+  if (!Array.isArray(items) || !items.length) return '0';
+  const last = items[items.length - 1];
+  return `${items.length}:${last.id || ''}:${last.status || ''}:${last.updated_at || ''}:${(last.content || '').length}`;
+}
+
 async function refreshConversationMessages(id, gen) {
   const latest = await get('/customers/' + Number(id));
   if (gen !== convPollGeneration || currentPage !== 'conversations') return;
   const area = document.querySelector('.chat-messages');
   if (!area) return;
-  const atBottom = area.scrollTop + area.clientHeight >= area.scrollHeight - 36;
-  const scroll = area.scrollTop;
-  area.innerHTML = renderChatMessages(latest.conversations, latest.customer);
-  area.scrollTop = atBottom ? area.scrollHeight : scroll;
-  document.getElementById('chat-sync-state').textContent = '';
+  const sig = conversationMessagesSig(latest.conversations);
+  if (area.dataset.convSig !== sig) {
+    const atBottom = area.scrollTop + area.clientHeight >= area.scrollHeight - 36;
+    const scroll = area.scrollTop;
+    area.innerHTML = renderChatMessages(latest.conversations, latest.customer);
+    area.dataset.convSig = sig;
+    area.scrollTop = atBottom ? area.scrollHeight : scroll;
+  }
+  const sync = document.getElementById('chat-sync-state');
+  if (sync) sync.textContent = '';
 }
 async function sendManual(cid) {
   const ta = document.getElementById('manual-msg'), customer = activeConversationCustomer;

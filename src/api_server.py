@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -52,7 +53,14 @@ def _init_app():
 async def _lifespan(app: FastAPI):
     """Runs AFTER uvicorn successfully binds the port."""
     _server_started.set()
-    yield
+    try:
+        yield
+    finally:
+        try:
+            from bridge_client import close_http_clients
+            await close_http_clients()
+        except Exception:
+            pass
 
 
 # Auto-initialize when running standalone (web_main.py / direct uvicorn)
@@ -216,7 +224,12 @@ async def receive_qr(data: dict, request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        await asyncio.to_thread(lambda: _accounts.get_conn().execute("SELECT 1").fetchone())
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.warning("Health probe degraded: %s", exc)
+        return JSONResponse({"status": "degraded", "error": str(exc)}, status_code=503)
 
 
 def _admin_html_path() -> Path:

@@ -512,7 +512,7 @@ class ProactiveSendTests(ReliabilityTestCase):
 
     def test_quiet_hours_is_overridable_only_by_manual_action(self):
         config_module._config.business.quiet_hours_start = 0
-        config_module._config.business.quiet_hours_end = 23
+        config_module._config.business.quiet_hours_end = 24
         cid = self.add_customer("+8613910000012")
         sid = self.add_schedule(cid)
         with patch("send_service.send_message", new_callable=AsyncMock,
@@ -600,8 +600,9 @@ class MigrationTests(ReliabilityTestCase):
         self.assertEqual(
             upgraded.execute("SELECT COUNT(*) FROM follow_up_schedule").fetchone()[0], 1
         )
+        from database import MIGRATIONS
         migrations = upgraded.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-        self.assertEqual(migrations, 2)
+        self.assertEqual(migrations, len(MIGRATIONS))
 
         # Close/reopen applies no duplicate migration and loses no rows.
         close_db()
@@ -610,7 +611,7 @@ class MigrationTests(ReliabilityTestCase):
             upgraded.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], legacy_count
         )
         self.assertEqual(
-            upgraded.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2
+            upgraded.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], len(MIGRATIONS)
         )
 
 

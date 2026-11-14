@@ -166,7 +166,22 @@
   let codeRequired = false;
   // 邀请链接：/login?invite=XXXX 自动切到注册并填好邀请码
   const inviteCode = new URLSearchParams(location.search).get('invite') || '';
-  let next = new URLSearchParams(location.search).get('next') || '/';
+  function safeNextPath(raw) {
+    if (!raw || typeof raw !== 'string') return '/';
+    const trimmed = raw.trim();
+    // Only allow same-origin relative paths starting with a single '/'.
+    if (!trimmed.startsWith('/') || trimmed.startsWith('//') || trimmed.startsWith('/\\')) {
+      return '/';
+    }
+    try {
+      const parsed = new URL(trimmed, location.origin);
+      if (parsed.origin !== location.origin) return '/';
+      return parsed.pathname + parsed.search + parsed.hash;
+    } catch (_) {
+      return '/';
+    }
+  }
+  const next = safeNextPath(new URLSearchParams(location.search).get('next'));
 
   function showError(msg) {
     err.textContent = msg;

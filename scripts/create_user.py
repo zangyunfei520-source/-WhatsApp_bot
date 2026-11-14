@@ -32,6 +32,8 @@ def main() -> int:
                         help="数据目录，默认项目下的 data/")
     parser.add_argument("--list", action="store_true", help="列出已有账号")
     parser.add_argument("--owner", action="store_true", help="标记为管理员（接管已有 data/）")
+    parser.add_argument("--reset-password", action="store_true",
+                        help="为指定邮箱重置密码（需配合 --password）")
     args = parser.parse_args()
 
     os.environ["WHATSAPP_BOT_DATA_DIR"] = str(Path(args.data_dir).expanduser().resolve())
@@ -49,6 +51,16 @@ def main() -> int:
         return 0
 
     email = args.email.strip().lower()
+    if args.reset_password:
+        if not args.password or len(args.password) < 8:
+            print("重置密码请通过 --password 指定至少 8 位的新密码", file=sys.stderr)
+            return 1
+        if not accounts.update_password(email, args.password):
+            print(f"未找到账号：{email}", file=sys.stderr)
+            return 1
+        print(f"密码已重置：{email}")
+        return 0
+
     if accounts.get_user_by_email(email):
         print(f"账号已存在：{email}", file=sys.stderr)
         return 1

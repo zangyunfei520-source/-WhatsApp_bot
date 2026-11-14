@@ -166,7 +166,7 @@ async def login_page(request: Request):
 @router.get("/api/auth/status")
 async def auth_status(request: Request):
     token = request.cookies.get(accounts.SESSION_COOKIE)
-    session = accounts.resolve_session(token) if token else None
+    session = await asyncio.to_thread(accounts.resolve_session, token) if token else None
     return {
         "has_users": accounts.count_users() > 0,
         "authed": bool(session),
@@ -288,7 +288,7 @@ async def logout(request: Request):
 @router.get("/api/auth/me")
 async def me(request: Request):
     token = request.cookies.get(accounts.SESSION_COOKIE)
-    session = accounts.resolve_session(token) if token else None
+    session = await asyncio.to_thread(accounts.resolve_session, token) if token else None
     if not session:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return {"email": session["email"], "user_id": session["user_id"]}
@@ -360,7 +360,7 @@ async def middleware(request: Request, call_next):
         return await call_next(request)
 
     token = request.cookies.get(accounts.SESSION_COOKIE)
-    session = accounts.resolve_session(token) if token else None
+    session = await asyncio.to_thread(accounts.resolve_session, token) if token else None
 
     new_token = None
     if not session:

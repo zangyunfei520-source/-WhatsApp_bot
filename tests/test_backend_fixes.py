@@ -304,6 +304,93 @@ class BackendFixesTest(unittest.TestCase):
             else:
                 os.environ["WA_PUBLIC_ORIGIN"] = prev
 
+    def test_web_main_no_scheduler_still_starts_bridge_watchdog(self):
+        import web_main
+
+        watchdog_calls = []
+        scheduler_calls = []
+        fake_uvicorn = type("FakeUvicorn", (), {"run": staticmethod(lambda *a, **kw: None)})
+
+        with patch("bridge_manager.start_watchdog", side_effect=lambda: watchdog_calls.append(True)), \
+             patch("bridge_manager.shutdown_all"), \
+             patch("scheduler.start_scheduler", side_effect=lambda: scheduler_calls.append(True)), \
+             patch.dict("sys.modules", {"uvicorn": fake_uvicorn}):
+            rc = web_main.main([
+                "--no-scheduler",
+                "--no-browser",
+                "--data-dir", str(self.tmp / "webmain_data"),
+                "--port", "18765",
+            ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(scheduler_calls, [])
+        self.assertEqual(watchdog_calls, [True])
+
+    def test_bridge_auth_headers_and_log_rotation(self):
+        bridge_manager._tokens["u1"] = "tok-xyz"
+        try:
+            self.assertEqual(bridge_manager.auth_headers(self.t1), {"X-Bridge-Token": "tok-xyz"})
+            self.assertEqual(bridge_manager.auth_headers(self.t2), {})
+        finally:
+            bridge_manager._tokens.pop("u1", None)
+
+        log_file = self.tmp / "bridge.log"
+        log_file.write_text("x" * 128, encoding="utf-8")
+        bridge_manager._rotate_bridge_log(log_file, max_bytes=64, backup_count=2)
+        self.assertFalse(log_file.exists())
+        self.assertTrue((self.tmp / "bridge.log.1").exists())
+
+    def test_accounts_update_password_revokes_sessions_and_throttles_last_seen(self):
+        user = accounts.create_user("reset@example.com", "oldpass123", self.t1_dir, user_id="u-reset")
+        token = accounts.create_session(user["id"], ip="127.0.0.1", ua="test")
+        resolved1 = accounts.resolve_session(token)
+        self.assertIsNotNone(resolved1)
+
+        token_hash = accounts._hash_token(token)
+        conn = accounts.get_conn()
+        before_last_seen = conn.execute(
+            "SELECT last_seen FROM sessions WHERE token_hash=?", (token_hash,)
+        ).fetchone()["last_seen"]
+        # Force a different last_seen within 60s window and confirm resolve_session avoids unnecessary write
+        from datetime import datetime, timedelta
+        recent = (datetime.now() - timedelta(seconds=10)).isoformat(timespec="seconds")
+        conn.execute("UPDATE sessions SET last_seen=? WHERE token_hash=?", (recent, token_hash))
+        conn.commit()
+        accounts.resolve_session(token)
+        after_last_seen = conn.execute(
+            "SELECT last_seen FROM sessions WHERE token_hash=?", (token_hash,)
+        ).fetchone()["last_seen"]
+        self.assertEqual(after_last_seen, recent)
+
+        changed = accounts.update_password("reset@example.com", "newpass1234")
+        self.assertTrue(changed)
+        self.assertIsNone(accounts.authenticate("reset@example.com", "oldpass123"))
+        self.assertIsNotNone(accounts.authenticate("reset@example.com", "newpass1234"))
+        self.assertIsNone(accounts.resolve_session(token))
+        self.assertFalse(accounts.update_password("missing@example.com", "newpass1234"))
+
+    def test_admin_bridge_restart_endpoint_uses_tenant_context(self):
+        accounts.create_user("owner@example.com", "pass123456", self.t1_dir, user_id="u1")
+        token = accounts.create_session("u1")
+        client = TestClient(api_server.app, client=("127.0.0.1", 50000))
+        client.cookies.set("wa_session", token)
+        with patch("bridge_manager.restart", return_value={"online": True, "port": 3101, "started": True}) as mock_restart:
+            resp = client.post("/admin/api/bridge/restart", headers={"Host": "127.0.0.1:8000"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["port"], 3101)
+        mock_restart.assert_called_once()
+        self.assertEqual(mock_restart.call_args[0][0].user_id, "u1")
+
+    def test_security_and_limit_guards_present_in_bridge_and_login(self):
+        root = Path(__file__).resolve().parent.parent
+        bridge_js = (root / "bridge" / "index.js").read_text(encoding="utf-8")
+        self.assertIn("hasValidBridgeToken", bridge_js)
+        self.assertIn("limit: '75mb'", bridge_js)
+        login_html = (root / "src" / "static" / "login.html").read_text(encoding="utf-8")
+        self.assertIn("function safeNextPath", login_html)
+
 
 if __name__ == "__main__":
     unittest.main()

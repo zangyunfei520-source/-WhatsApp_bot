@@ -1,5 +1,6 @@
 const express = require('express');
 const qrcode = require('qrcode-terminal');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const sendResult = require('./lib/send-result');
@@ -19,7 +20,33 @@ const TENANT_HEADERS = {
 };
 
 const app = express();
-app.use(express.json());
+// /send-document accepts up to 50MB raw files (~67MB base64 JSON); keep other
+// JSON endpoints tightly capped while still above Express's 100KB default.
+app.use('/send-document', express.json({ limit: '75mb' }));
+app.use(express.json({ limit: '1mb' }));
+app.use((err, _req, res, next) => {
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({ status: 'failed', error: '请求体过大', error_code: 'payload_too_large' });
+    }
+    return next(err);
+});
+
+function hasValidBridgeToken(req) {
+    if (!BRIDGE_TOKEN) return true;
+    const provided = req.get('X-Bridge-Token') || '';
+    const a = Buffer.from(provided, 'utf8');
+    const b = Buffer.from(BRIDGE_TOKEN, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+app.use((req, res, next) => {
+    if (req.path === '/health') return next();
+    if (!hasValidBridgeToken(req)) {
+        return res.status(401).json({ status: 'failed', error: 'unauthorized bridge request', error_code: 'unauthorized' });
+    }
+    return next();
+});
 
 let sock = null, clientReady = false, isShutdown = false;
 const contacts = new Map();
@@ -195,7 +222,9 @@ async function start() {
             if (isShutdown) return;
             if (code === DisconnectReason.loggedOut) {
                 try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
-                resetBackoff(); backoffTimer = setTimeout(start, 3000); return;
+                notifyPython('/webhook/qr', { qr_text: null });
+                backoffTimer = setTimeout(start, getBackoffDelay());
+                return;
             }
             backoffTimer = setTimeout(start, getBackoffDelay());
         }

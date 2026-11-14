@@ -54,7 +54,7 @@ function uploadProductDocs() {
     try {
       const fd = new FormData();
       for (const f of files) fd.append('files', f);
-      const r = await fetch(API + '/product-docs/upload', {method:'POST', body:fd});
+      const r = await apiFetch(API + '/product-docs/upload', {method:'POST', body:fd}, 120000);
       const d = await readJson(r);
       if (!r.ok) throw new Error(d.error || d.detail || ('HTTP ' + r.status));
       if (d.error) { uiAlert('上传失败：' + d.error); return; }

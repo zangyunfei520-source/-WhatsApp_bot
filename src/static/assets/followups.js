@@ -468,7 +468,7 @@ function followupModuleError(result, label) {
   return `<div class="followup-module-error" role="status">${escapeHtml(label)}读取失败：${escapeHtml(result.reason?.message || '网络错误')}。请手动刷新。</div>`;
 }
 
-async function loadFollowups(el) {
+async function loadFollowups(el, seq) {
   // A history-module failure must not erase a usable schedule list, or turn
   // missing history into a healthy zero. Never retry sending as a side effect.
   const modules = await Promise.allSettled([
@@ -478,6 +478,7 @@ async function loadFollowups(el) {
     get('/followups?filter_type=unknown'),
     get('/followups?filter_type=paused'),
   ]);
+  if (!isCurrentPageSeq(seq)) return;
   if (modules[0].status === 'rejected') throw modules[0].reason;
   const [dueRes, sentRes, failedRes, unknownRes, pausedRes] = modules.map(r => r.status === 'fulfilled' ? r.value : {items: []});
   const issueItems = [...failedRes.items, ...unknownRes.items]

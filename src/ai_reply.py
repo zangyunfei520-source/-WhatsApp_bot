@@ -46,15 +46,27 @@ def _get_client() -> OpenAI:
 
 # ── Specs loader ─────────────────────────────────────────────────────────────
 
-def _load_product_specs() -> str:
+_MAX_PRODUCT_SPECS_CHARS = 12000
+
+
+def _load_product_specs(max_chars: int = _MAX_PRODUCT_SPECS_CHARS) -> str:
     try:
         from database import get_connection
         conn = get_connection()
         rows = conn.execute("SELECT title, content FROM product_docs ORDER BY updated_at DESC").fetchall()
         if rows:
             parts = []
+            used = 0
             for r in rows:
-                parts.append(f"## {r['title']}\n{r['content']}")
+                section = f"## {r['title']}\n{r['content']}"
+                if used + len(section) <= max_chars:
+                    parts.append(section)
+                    used += len(section) + 2
+                else:
+                    remaining = max_chars - used
+                    if remaining > 120:
+                        parts.append(section[:remaining - 20].rstrip() + "\n...(truncated)")
+                    break
             return "\n\n".join(parts)
     except Exception:
         pass
@@ -65,7 +77,10 @@ def _load_product_specs() -> str:
         logger.warning(f"product_specs.txt not found at {p}")
         return "(参数文档暂未加载)"
     try:
-        return p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8")
+        if len(text) > max_chars:
+            return text[:max_chars - 20].rstrip() + "\n...(truncated)"
+        return text
     except Exception as e:
         logger.error(f"Failed to read product_specs.txt: {e}")
         return "(参数文档读取失败)"

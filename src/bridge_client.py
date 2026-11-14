@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -25,6 +27,42 @@ import httpx
 from config import get_config
 
 logger = logging.getLogger(__name__)
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+_loop_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = weakref.WeakKeyDictionary()
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _loop_clients.get(loop)
+    if client is None or client.is_closed:
+        client = _REAL_ASYNC_CLIENT(
+            trust_env=False,
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        _loop_clients[loop] = client
+    return client
+
+
+@asynccontextmanager
+async def _http_client(timeout: float):
+    # Preserve mockability when unit tests patch bridge_client.httpx.AsyncClient.
+    if httpx.AsyncClient is not _REAL_ASYNC_CLIENT:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            yield client
+        return
+    yield _shared_http_client()
+
+
+async def close_http_clients() -> None:
+    """Close pooled HTTP clients on application shutdown."""
+    clients = list(_loop_clients.values())
+    _loop_clients.clear()
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 def _result(status: str, *, message_id: Optional[str] = None,
@@ -57,10 +95,11 @@ async def send_message(phone: str, message: str, max_retries: int = 2,
 
     attempts = max(1, int(max_retries))
     last_connect_error = None
+    headers = bridge_manager.auth_headers()
     for attempt in range(attempts):
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                resp = await client.post(url, json=payload)
+            async with _http_client(timeout) as client:
+                resp = await client.post(url, json=payload, headers=headers, timeout=timeout)
         except httpx.ConnectError as e:
             # The TCP connection was never established. It is safe to retry.
             last_connect_error = e

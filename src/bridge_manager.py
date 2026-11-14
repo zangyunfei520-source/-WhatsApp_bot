@@ -151,6 +151,17 @@ def verify_bridge_token(tenant_id: str, presented: Optional[str]) -> bool:
     return hmac.compare_digest(expected, presented or "")
 
 
+def auth_headers(tenant: Optional[Tenant] = None) -> Dict[str, str]:
+    """Return X-Bridge-Token header for outbound Python -> Bridge requests."""
+    tenant = tenant or tenancy.current()
+    if tenant is None:
+        return {}
+    token = _tokens.get(tenant.user_id)
+    if not token:
+        return {}
+    return {"X-Bridge-Token": token}
+
+
 # ── 端口 ────────────────────────────────────────────────────────────────
 
 def _port_free(port: int) -> bool:
@@ -244,6 +255,20 @@ def _log_path(data_dir: Path) -> Path:
     return logs / "bridge.log"
 
 
+def _rotate_bridge_log(path: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 3) -> None:
+    """Rotate oversized bridge.log before spawning a child process."""
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        for idx in range(backup_count, 0, -1):
+            src = path if idx == 1 else path.with_name(f"{path.name}.{idx - 1}")
+            dst = path.with_name(f"{path.name}.{idx}")
+            if src.exists():
+                src.replace(dst)
+    except Exception:
+        logger.warning("[bridge] 日志轮转失败: %s", path, exc_info=True)
+
+
 def start(tenant: Tenant) -> dict:
     """确保该租户的 bridge 在运行，返回状态。"""
     with _lock:
@@ -292,7 +317,9 @@ def start(tenant: Tenant) -> dict:
             env["HTTPS_PROXY"] = env["https_proxy"] = proxy
             env["HTTP_PROXY"] = env["http_proxy"] = proxy
 
-        with open(_log_path(tenant.data_dir), "a", encoding="utf-8") as log:
+        log_file = _log_path(tenant.data_dir)
+        _rotate_bridge_log(log_file)
+        with open(log_file, "a", encoding="utf-8") as log:
             proc = subprocess.Popen(
                 [_node_bin(), str(ROOT / "bridge" / "index.js")],
                 cwd=str(ROOT), env=env,

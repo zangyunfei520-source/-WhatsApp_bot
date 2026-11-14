@@ -1,5 +1,6 @@
-async function loadDashboard(el) {
+async function loadDashboard(el, seq) {
   const d = await get('/dashboard');
+  if (!isCurrentPageSeq(seq)) return;
   const c = d.counts, w = d.workspace || {}, b = d.bridge || {};
   const connected = b.online && b.authenticated;
   updateBridgeIndicator({...b, known: true});

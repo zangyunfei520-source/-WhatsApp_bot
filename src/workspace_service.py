@@ -7,11 +7,11 @@ from database import get_connection
 WORKSPACE_QUERY = """
 WITH messages AS (
     SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY customer_id ORDER BY julianday(sent_at) DESC, id DESC
+        PARTITION BY customer_id ORDER BY sent_at DESC, id DESC
     ) AS position FROM conversations
 ), reply_state AS (
     SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY customer_id ORDER BY julianday(sent_at) DESC, id DESC
+        PARTITION BY customer_id ORDER BY sent_at DESC, id DESC
     ) AS position FROM conversations
     WHERE direction='inbound' OR status IN ('sent','pending','unknown')
 ), schedules AS (
@@ -35,7 +35,7 @@ LEFT JOIN lead_scores ls ON ls.customer_id=c.id
 def conversation_workspace(limit=50):
     rows = get_connection().execute(
         f"SELECT * FROM ({WORKSPACE_QUERY}) WHERE msg_count>0 "
-        "ORDER BY julianday(last_msg) DESC, last_message_id DESC LIMIT ?", (limit,)
+        "ORDER BY last_msg DESC, last_message_id DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -49,12 +49,12 @@ def workspace_overview():
     tasks = conn.execute(
         f"SELECT * FROM ({WORKSPACE_QUERY}) WHERE status='active' "
         "AND (needs_reply=1 OR julianday(next_followup_at)<=julianday(?)) "
-        "ORDER BY needs_reply DESC, julianday(next_followup_at), julianday(last_msg) DESC LIMIT 6",
+        "ORDER BY needs_reply DESC, next_followup_at ASC, last_msg DESC LIMIT 6",
         (now,)
     ).fetchall()
     leads = conn.execute(
         f"SELECT * FROM ({WORKSPACE_QUERY}) WHERE status='active' AND score>=40 "
-        "ORDER BY score DESC, julianday(last_msg) DESC LIMIT 4"
+        "ORDER BY score DESC, last_msg DESC LIMIT 4"
     ).fetchall()
     return {"needs_reply": needs_reply, "tasks": [dict(r) for r in tasks],
             "priority_leads": [dict(r) for r in leads]}

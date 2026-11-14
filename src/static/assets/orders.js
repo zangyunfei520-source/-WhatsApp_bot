@@ -1,6 +1,17 @@
 /* ── Orders ─────────────────────────────────────────────────── */
 
 let ordersPage = 1, ordersSearch = '', ordersStatusFilter = '';
+let ordersSearchTimer = null;
+
+function onOrdersSearchInput(val) {
+  ordersSearch = val;
+  ordersPage = 1;
+  if (ordersSearchTimer) clearTimeout(ordersSearchTimer);
+  ordersSearchTimer = setTimeout(() => {
+    ordersSearchTimer = null;
+    if (currentPage === 'orders') loadPage('orders');
+  }, 300);
+}
 
 function statusLabel(s) {
   const labels = {pending:'待确认',confirmed:'已确认',processing:'生产中',shipped:'已发货',delivered:'已交付',cancelled:'已取消'};
@@ -8,12 +19,17 @@ function statusLabel(s) {
   return `<span class="badge ${classes[s]||'badge-gray'}">${labels[s]||escapeHtml(s||'—')}</span>`;
 }
 
-async function loadOrders(el) {
+async function loadOrders(el, seq) {
   const r = await get(`/orders?page=${ordersPage}&search=${encodeURIComponent(ordersSearch)}&status=${ordersStatusFilter}`);
+  if (!isCurrentPageSeq(seq)) return;
   // The unfiltered count is informational; failure must not hide the order list.
   let totalOrders = r.total;
   if (ordersSearch || ordersStatusFilter) {
-    try { totalOrders = (await get('/orders?per_page=1')).total; } catch (_) { totalOrders = null; }
+    try {
+      const allRes = await get('/orders?per_page=1');
+      if (!isCurrentPageSeq(seq)) return;
+      totalOrders = allRes.total;
+    } catch (_) { totalOrders = null; }
   }
   const pages = Math.ceil(r.total / r.per_page) || 1;
   const rows = r.items.map(o => `
@@ -46,7 +62,7 @@ async function loadOrders(el) {
     <div class="toolbar orders-toolbar">
         <div class="search-field">
           ${uiIcon('search')}
-          <input class="input" placeholder="搜索订单号 / 产品 / 客户..." value="${escapeHtml(ordersSearch)}" onchange="ordersSearch=this.value;ordersPage=1;loadPage('orders')">
+          <input class="input" placeholder="搜索订单号 / 产品 / 客户..." value="${escapeHtml(ordersSearch)}" oninput="onOrdersSearchInput(this.value)" onchange="if(ordersSearchTimer){clearTimeout(ordersSearchTimer);ordersSearchTimer=null;}ordersSearch=this.value;ordersPage=1;loadPage('orders')">
         </div>
         <select class="input" style="width:150px" onchange="ordersStatusFilter=this.value;ordersPage=1;loadPage('orders')">
           <option value="">全部状态</option>
@@ -82,12 +98,22 @@ async function openOrderForm(orderId, presetCustomerId) {
 }
 
 async function renderOrderForm(orderId, presetCustomerId) {
-  const customers = await get('/customers-with-conversations');
+  const [custRes, orderRes] = await Promise.all([
+    get('/customers?per_page=200&sort=updated_at&order=desc'),
+    orderId ? get(`/orders/${orderId}`) : Promise.resolve(null),
+  ]);
+  const customers = Array.isArray(custRes) ? custRes : (custRes.items || []);
   let order = null;
   if (orderId) {
-    const r = await get(`/orders/${orderId}`);
-    if (!r.order) throw new Error(r.error || '订单不存在');
-    order = r.order;
+    if (!orderRes || !orderRes.order) throw new Error((orderRes && orderRes.error) || '订单不存在');
+    order = orderRes.order;
+  }
+  const selectedCid = Number((order && order.customer_id) || presetCustomerId || 0);
+  if (selectedCid && !customers.some(c => Number(c.id) === selectedCid)) {
+    try {
+      const detail = await get(`/customers/${selectedCid}`);
+      if (detail && detail.customer) customers.unshift(detail.customer);
+    } catch (_) {}
   }
   const sidebar = document.getElementById('detail-sidebar');
   sidebar.innerHTML = `

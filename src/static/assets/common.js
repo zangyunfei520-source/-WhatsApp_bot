@@ -288,17 +288,26 @@ async function readJson(r) {
     throw new Error(`Invalid JSON response (HTTP ${r.status}, ${ct})`);
   }
 }
-async function get(url) {
-  const r = await apiFetch(API + url, {}, 30000);
+async function get(url, timeoutMs = 30000) {
+  const r = await apiFetch(API + url, {}, timeoutMs);
   const data = await readJson(r);
   if (!r.ok) throw new Error(data.error || data.detail || ('HTTP ' + r.status));
   return data;
 }
-async function post(url, data) {
-  const r = await apiFetch(API + url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+async function post(url, data, timeoutMs = 20000) {
+  const r = await apiFetch(API + url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}, timeoutMs);
   const body = await readJson(r);
   if (!r.ok) throw new Error(body.error || body.detail || ('HTTP ' + r.status));
   return body;
+}
+async function withButtonLock(btn, fn) {
+  if (btn && btn.disabled) return;
+  if (btn) btn.disabled = true;
+  try {
+    return await fn();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 function importCustomers() {
   const inp = document.createElement('input');
@@ -307,7 +316,7 @@ function importCustomers() {
     const file = inp.files[0]; if (!file) return;
     const fd = new FormData(); fd.append('file', file);
     try {
-    const r = await fetch(API + '/customers/import', {method:'POST', body:fd});
+    const r = await apiFetch(API + '/customers/import', {method:'POST', body:fd}, 120000);
     const d = await readJson(r);
     if (!r.ok) throw new Error(d.error || d.detail || ('HTTP ' + r.status));
     if (d.error) { uiAlert('导入失败：' + d.error); return; }
@@ -369,6 +378,9 @@ function escapeJs(s) { return String(s ?? '').replace(/\\/g,'\\\\').replace(/'/g
 
 /* ── Page Loaders ────────────────────────────────────────────── */
 let pageLoadSequence = 0;
+function isCurrentPageSeq(seq) {
+  return seq === undefined || seq === pageLoadSequence;
+}
 async function loadPage(page) {
   const el = document.getElementById('page-' + page);
   if (!el) return;
@@ -376,15 +388,15 @@ async function loadPage(page) {
   el.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
   try {
     switch(page) {
-      case 'dashboard': await loadDashboard(el); break;
-      case 'customers': await loadCustomers(el); break;
-      case 'conversations': await loadConversations(el); break;
-      case 'followups': await loadFollowups(el); break;
-      case 'orders': await loadOrders(el); break;
-      case 'product-docs': await loadProductDocs(el); break;
-      case 'bridge': await loadBridge(el); break;
-      case 'activity': await loadActivity(el); break;
-      case 'setup': await loadSetup(el); break;
+      case 'dashboard': await loadDashboard(el, seq); break;
+      case 'customers': await loadCustomers(el, seq); break;
+      case 'conversations': await loadConversations(el, seq); break;
+      case 'followups': await loadFollowups(el, seq); break;
+      case 'orders': await loadOrders(el, seq); break;
+      case 'product-docs': await loadProductDocs(el, seq); break;
+      case 'bridge': await loadBridge(el, seq); break;
+      case 'activity': await loadActivity(el, seq); break;
+      case 'setup': await loadSetup(el, seq); break;
     }
   } catch (e) {
     if (seq !== pageLoadSequence) return;
@@ -434,28 +446,37 @@ function applyPauseUnknown() {
   if (area) area.title = '暂停机器人：状态未知';
 }
 
+let botStateInFlight = false;
 async function checkBotState() {
-  let stateOk = false;
+  if (botStateInFlight) return;
+  botStateInFlight = true;
   try {
-    const s = await get('/bot-state');
-    if (typeof s.paused !== 'boolean') throw new Error('暂停状态返回格式错误');
-    stateOk = true;
-    lastPauseState = s.paused;
-    applyPauseState(s.paused);
-    const sw = document.getElementById('pause-switch');
-    if (sw) sw.disabled = false;
-    const stats = document.getElementById('pause-stats');
-    if (stats) stats.textContent = `今日 AI 回复 ${s.today_ai_replies} · 跟进 ${s.today_followups}`;
-  } catch(e) {
-    // A stale "运行中" was how a dead backend got mistaken for a healthy one.
+    const [stateRes, bridgeRes] = await Promise.allSettled([get('/bot-state'), get('/bridge')]);
+    if (stateRes.status === 'fulfilled') {
+      const s = stateRes.value;
+      if (typeof s.paused !== 'boolean') throw new Error('暂停状态返回格式错误');
+      lastPauseState = s.paused;
+      applyPauseState(s.paused);
+      const sw = document.getElementById('pause-switch');
+      if (sw) sw.disabled = false;
+      const stats = document.getElementById('pause-stats');
+      if (stats) stats.textContent = `今日 AI 回复 ${s.today_ai_replies} · 跟进 ${s.today_followups}`;
+    } else {
+      // A stale "运行中" was how a dead backend got mistaken for a healthy one.
+      applyPauseUnknown();
+    }
+    // Keep "bot paused" and "WhatsApp connected" as separate facts.
+    if (bridgeRes.status === 'fulfilled') {
+      const b = bridgeRes.value;
+      updateBridgeIndicator({online: b.online, authenticated: b.authenticated, known: true, phone: b.phone});
+    } else {
+      updateBridgeIndicator({known: false});
+    }
+  } catch (e) {
     applyPauseUnknown();
-  }
-  // Keep "bot paused" and "WhatsApp connected" as separate facts.
-  try {
-    const b = await get('/bridge');
-    updateBridgeIndicator({online: b.online, authenticated: b.authenticated, known: true, phone: b.phone});
-  } catch(e) {
     updateBridgeIndicator({known: false});
+  } finally {
+    botStateInFlight = false;
   }
 }
 

@@ -98,8 +98,7 @@ async def save_setup(data: dict):
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
-@router.get("/dashboard")
-async def dashboard():
+def _dashboard_sync() -> dict:
     from workspace_service import workspace_overview
     conn = get_connection()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -158,9 +157,6 @@ async def dashboard():
         "GROUP BY c.id ORDER BY last_contact DESC LIMIT 10"
     ).fetchall()
 
-    # Bridge status
-    bridge = await _get_bridge_status()
-
     # Upcoming schedule
     upcoming = conn.execute(
         "SELECT date(fs.next_followup_at) as dt, COUNT(*) as cnt FROM follow_up_schedule fs "
@@ -179,7 +175,6 @@ async def dashboard():
             "failed_fu_today": failed_fu_today, "unknown_fu_today": unknown_fu_today,
             "total_schedules": total_schedules, "total_conversations": total_conv,
         },
-        "bridge": bridge,
         "failed_recent": [dict(r) for r in failed_recent],
         "recent_active": [
             {"id": r["id"], "name": r["name"], "phone": r["phone"],
@@ -191,17 +186,19 @@ async def dashboard():
     }
 
 
+@router.get("/dashboard")
+async def dashboard():
+    data, bridge = await asyncio.gather(
+        asyncio.to_thread(_dashboard_sync),
+        _get_bridge_status(),
+    )
+    data["bridge"] = bridge
+    return data
+
+
 # ── Customers ──────────────────────────────────────────────────────────────────
 
-@router.get("/customers")
-async def customers(
-    page: int = Query(1, ge=1),
-    per_page: int = Query(30, ge=5, le=100),
-    search: str = Query(""),
-    status: str = Query(""),
-    sort: str = Query("updated_at"),
-    order: str = Query("desc"),
-):
+def _customers_sync(page: int, per_page: int, search: str, status: str, sort: str, order: str) -> dict:
     conn = get_connection()
     allowed_sorts = {"name", "company", "status", "created_at", "updated_at"}
     if sort not in allowed_sorts:
@@ -240,6 +237,18 @@ async def customers(
         "per_page": per_page,
         "items": [dict(r) for r in rows],
     }
+
+
+@router.get("/customers")
+async def customers(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(30, ge=5, le=200),
+    search: str = Query(""),
+    status: str = Query(""),
+    sort: str = Query("updated_at"),
+    order: str = Query("desc"),
+):
+    return await asyncio.to_thread(_customers_sync, page, per_page, search, status, sort, order)
 
 
 # ── Invalid Phone Detection & Cleanup (must be BEFORE {customer_id} route) ──
@@ -603,18 +612,7 @@ async def conversations_list(
     }
 
 
-@router.get("/customers-with-conversations")
-async def customers_with_conversations():
-    from workspace_service import conversation_workspace
-    return conversation_workspace()
-
-
-# ── Follow-ups ─────────────────────────────────────────────────────────────────
-
-@router.get("/followups")
-async def followups(
-    filter_type: str = Query("due", description="due | today_sent | failed | unknown | paused"),
-):
+def _followups_sync(filter_type: str) -> dict:
     conn = get_connection()
     now_iso = datetime.now().isoformat()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -655,6 +653,21 @@ async def followups(
         rows = []
 
     return {"filter": filter_type, "items": [dict(r) for r in rows]}
+
+
+@router.get("/customers-with-conversations")
+async def customers_with_conversations():
+    from workspace_service import conversation_workspace
+    return await asyncio.to_thread(conversation_workspace)
+
+
+# ── Follow-ups ─────────────────────────────────────────────────────────────────
+
+@router.get("/followups")
+async def followups(
+    filter_type: str = Query("due", description="due | today_sent | failed | unknown | paused"),
+):
+    return await asyncio.to_thread(_followups_sync, filter_type)
 
 
 @router.get("/followups/by-date")
@@ -1151,6 +1164,23 @@ async def bridge_stop():
     return {"ok": True}
 
 
+@router.post("/bridge/restart")
+async def bridge_restart():
+    """Atomically restart the current tenant's bridge under bridge_manager lock."""
+    import bridge_manager
+    import tenancy
+
+    tenant = tenancy.current()
+    if tenant is None:
+        return {"ok": False, "error": "需要登录"}
+    try:
+        result = await asyncio.to_thread(bridge_manager.restart, tenant)
+    except Exception as exc:
+        logger.warning("bridge 重启失败: %s", exc)
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result}
+
+
 def _read_bridge_events_sync(paths: list[Path]) -> list[str]:
     bridge_events = []
     try:
@@ -1351,19 +1381,26 @@ async def toggle_bot_state():
 async def _get_bridge_status() -> dict:
     cfg = get_config()
     try:
-        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
-            import bridge_manager
-            port = bridge_manager.current_port()
-            resp = await client.get(f"http://{cfg.bridge.host}:{port}/status")
-            resp.raise_for_status()
-            bs = resp.json()
-            if not isinstance(bs, dict) or not isinstance(bs.get("authenticated"), bool):
-                raise ValueError("Bridge returned an invalid status response")
-            return {
-                "online": True,
-                "authenticated": bs.get("authenticated", False),
-                "phone": bs.get("phone"),
-            }
+        import bridge_manager
+        from bridge_client import _shared_http_client
+
+        port = bridge_manager.current_port()
+        headers = bridge_manager.auth_headers()
+        client = _shared_http_client()
+        resp = await client.get(
+            f"http://{cfg.bridge.host}:{port}/status",
+            headers=headers,
+            timeout=3.0,
+        )
+        resp.raise_for_status()
+        bs = resp.json()
+        if not isinstance(bs, dict) or not isinstance(bs.get("authenticated"), bool):
+            raise ValueError("Bridge returned an invalid status response")
+        return {
+            "online": True,
+            "authenticated": bs.get("authenticated", False),
+            "phone": bs.get("phone"),
+        }
     except Exception as e:
         return {"online": False, "authenticated": False, "phone": None, "error": str(e)}
 
