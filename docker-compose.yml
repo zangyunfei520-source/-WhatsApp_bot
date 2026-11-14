@@ -12,7 +12,7 @@ services:
     environment:
       TZ: Asia/Shanghai
       # 公网访问域名（经 Cloudflare Tunnel / 反向代理接入时用于同源校验）
-      WA_PUBLIC_ORIGIN: "https://bots.xueai88.xyz"
+      WA_PUBLIC_ORIGIN: "https://bot.xueai88.xyz"
       # 关闭自助注册时改成 0
       WA_ALLOW_SIGNUP: "1"
       # 平台级默认 LLM Key（用户可在自己的 data/.env 里覆盖）

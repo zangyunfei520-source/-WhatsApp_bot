@@ -60,7 +60,7 @@ docker run --rm -v ~/.cloudflared:/home/nonroot/.cloudflared \
   cloudflare/cloudflared:latest tunnel create whatsapp-bot
 
 # 绑定域名
-cloudflared tunnel route dns whatsapp-bot bots.xueai88.xyz
+cloudflared tunnel route dns whatsapp-bot bot.xueai88.xyz
 ```
 
 `~/.cloudflared/config.yml`：
@@ -69,7 +69,7 @@ cloudflared tunnel route dns whatsapp-bot bots.xueai88.xyz
 tunnel: <UUID>
 credentials-file: /home/nonroot/.cloudflared/<UUID>.json
 ingress:
-  - hostname: bots.xueai88.xyz
+  - hostname: bot.xueai88.xyz
     service: http://127.0.0.1:8000
   - service: http_status:404
 ```
@@ -93,7 +93,7 @@ ingress:
 Cloudflare Zero Trust → Access → Applications → Add：
 
 - Type: Self-hosted
-- Domain: `bots.xueai88.xyz`
+- Domain: `bot.xueai88.xyz`
 - Policy: Allow，选择你的邮箱（或整个域名），需要 One-time PIN
 
 之后访问会先过 Cloudflare 验证，再到应用登录页。
@@ -111,7 +111,7 @@ Cloudflare Zero Trust → Access → Applications → Add：
 
 应用支持"过了 Cloudflare Access 就直接进"，用户完全看不到应用自己的登录页。
 
-1. 按第 5 节把 Access 应用建好（域名 `bots.xueai88.xyz`）
+1. 按第 5 节把 Access 应用建好（域名 `bot.xueai88.xyz`）
 2. 在 Zero Trust 控制台右上角复制你的 **team domain**，形如 `https://yourteam.cloudflareaccess.com`
 3. 启动服务时带上环境变量：
 
@@ -122,7 +122,7 @@ environment:
   CF_ACCESS_AUTO_LOGIN: "1"     # 设为 0 可关闭
 ```
 
-打开 `https://bots.xueai88.xyz` 的流程就变成：
+打开 `https://bot.xueai88.xyz` 的流程就变成：
 
 ```
 Cloudflare Access 验证邮箱（一次性验证码）
@@ -184,7 +184,7 @@ WhatsApp 对机房 IP 不算友好，很多时候必须挂代理。优先级从�
 自检接口：
 
 ```bash
-curl -s -b cookies.txt https://bots.xueai88.xyz/admin/api/netcheck | jq
+curl -s -b cookies.txt https://bot.xueai88.xyz/admin/api/netcheck | jq
 ```
 
 ```json

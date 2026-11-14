@@ -285,11 +285,11 @@ class BackendFixesTest(unittest.TestCase):
     def test_public_origin_csrf_allows_configured_domain_and_rejects_foreign(self):
         client = TestClient(api_server.app, client=("127.0.0.1", 50000))
         prev = os.environ.get("WA_PUBLIC_ORIGIN")
-        os.environ["WA_PUBLIC_ORIGIN"] = "https://bots.xueai88.xyz"
+        os.environ["WA_PUBLIC_ORIGIN"] = "https://bot.xueai88.xyz"
         try:
             ok_resp = client.post(
                 "/api/auth/logout",
-                headers={"Host": "127.0.0.1:8000", "Origin": "https://bots.xueai88.xyz"},
+                headers={"Host": "127.0.0.1:8000", "Origin": "https://bot.xueai88.xyz"},
             )
             self.assertEqual(ok_resp.status_code, 200)
 
