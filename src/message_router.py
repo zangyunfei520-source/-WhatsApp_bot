@@ -4,6 +4,7 @@ Ordering matters: persist and de-duplicate the inbound message first, THEN
 decide whether any automatic action is allowed. Pausing the bot or marking a
 customer as opted_out/blocked/inactive must never lose the customer's message.
 """
+import asyncio
 import logging
 from typing import Optional
 
@@ -60,7 +61,7 @@ async def handle_incoming_message(phone: str, body: str, msg_id: Optional[str] =
     if not allowed:
         return {**base, "action": "ignore", "reason": reason}
 
-    reply = generate_reply(customer, body)
+    reply = await asyncio.to_thread(generate_reply, customer, body)
     # Pause can be toggled while the LLM is generating; do not send then.
     if is_paused():
         return {**base, "action": "ignore", "reason": "bot_paused",
@@ -74,7 +75,7 @@ async def handle_incoming_message(phone: str, body: str, msg_id: Optional[str] =
         status="pending",
         send_kind="instant_reply",
     )
-    extract_and_store_memory(customer["id"], body, reply)
+    await asyncio.to_thread(extract_and_store_memory, customer["id"], body, reply)
     logger.info("Reply queued for %s (conversation=%s): %s", phone, outbound_id, reply[:60])
     return {
         **base,

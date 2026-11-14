@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -106,27 +106,42 @@ def set_message_handler(handler):
 
 
 def _bind_tenant(request: Request):
-    """按 bridge 回调里的 X-Tenant-Id 切换上下文；返回 reset token。"""
+    """按 bridge 回调里的 X-Tenant-Id 切换上下文并校验 X-Bridge-Token；返回 (reset_token, error_response)。"""
+    import accounts
+    import bridge_manager
+    import tenancy
+
     tid = (request.headers.get("x-tenant-id") or "").strip()
+    presented_token = (request.headers.get("x-bridge-token") or "").strip()
+
     if not tid:
-        return None
+        if accounts.count_users() > 0:
+            return None, JSONResponse({"error": "X-Tenant-Id required"}, status_code=400)
+        if not bridge_manager.verify_bridge_token("", presented_token):
+            return None, JSONResponse({"error": "invalid bridge token"}, status_code=403)
+        return None, None
+
+    if not bridge_manager.verify_bridge_token(tid, presented_token):
+        logger.warning("webhook token 校验失败: tenant=%s", tid)
+        return None, JSONResponse({"error": "invalid bridge token"}, status_code=403)
+
     try:
-        import accounts
-        import tenancy
         user = accounts.get_user(tid)
         if not user:
             logger.warning("webhook 携带了未知租户: %s", tid)
-            return None
+            return None, JSONResponse({"error": "unknown tenant"}, status_code=404)
         return tenancy.set_current(tenancy.Tenant(
-            user_id=user["id"], email=user["email"], data_dir=Path(user["data_dir"])))
+            user_id=user["id"], email=user["email"], data_dir=Path(user["data_dir"]))), None
     except Exception:
         logger.exception("webhook 绑定租户失败: %s", tid)
-        return None
+        return None, JSONResponse({"error": "tenant bind failed"}, status_code=500)
 
 
 @app.post("/webhook/message")
 async def receive_message(msg: IncomingMessage, request: Request):
-    token = _bind_tenant(request)
+    token, err = _bind_tenant(request)
+    if err is not None:
+        return err
     try:
         logger.info(f"[inbound] from={msg.from_} body={msg.body[:80]}")
         if _message_handler is None:
@@ -150,7 +165,9 @@ async def receive_delivery(receipt: DeliveryReceipt, request: Request):
     message id and status here. Repeating a receipt is a no-op and never
     creates a second conversation row.
     """
-    token = _bind_tenant(request)
+    token, err = _bind_tenant(request)
+    if err is not None:
+        return err
     try:
         if receipt.status not in ("sent", "failed", "unknown"):
             return {"ok": False, "changed": False,
@@ -179,7 +196,9 @@ async def receive_delivery(receipt: DeliveryReceipt, request: Request):
 async def receive_qr(data: dict, request: Request):
     from qr_state import set_pending_qr, clear_pending_qr
 
-    token = _bind_tenant(request)
+    token, err = _bind_tenant(request)
+    if err is not None:
+        return err
     try:
         qr_text = data.get("qr_text")
         if qr_text:

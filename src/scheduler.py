@@ -7,6 +7,7 @@ and atomically reserved daily quota. The switch is read at execution time, not
 cached at start-up.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
 from datetime import datetime
@@ -21,12 +22,24 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from bot_state import is_paused, is_proactive_followups_enabled, was_batch_pushed_today
 from config import get_config
-from database import get_connection, get_daily_quota_usage
+from database import db_write, get_connection, get_daily_quota_usage
 from followup import get_random_delay
 from send_service import is_quiet_hours, send_followup_now
 
 logger = logging.getLogger(__name__)
-_check_lock = threading.Lock()
+_locks_guard = threading.Lock()
+_tenant_locks: dict[str, threading.Lock] = {}
+
+
+def _get_tenant_lock() -> threading.Lock:
+    tenant = tenancy.current()
+    key = tenant.user_id if tenant else "default"
+    with _locks_guard:
+        lock = _tenant_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _tenant_locks[key] = lock
+        return lock
 
 
 # ── 多租户：每个用户各跑一遍 ────────────────────────────────────────────
@@ -59,6 +72,36 @@ def _run_for_tenants(job) -> None:
         finally:
             if token is not None:
                 tenancy.reset_current(token)
+
+
+def _run_for_tenants_parallel(job, max_workers: int = 4) -> None:
+    tenants = list(_iter_tenants())
+    if len(tenants) <= 1:
+        for tenant in tenants:
+            token = tenancy.set_current(tenant) if tenant else None
+            try:
+                job()
+            except Exception:
+                logger.exception("定时任务失败 tenant=%s",
+                                 tenant.user_id if tenant else "default")
+            finally:
+                if token is not None:
+                    tenancy.reset_current(token)
+        return
+
+    def _run_one(tenant: Optional[Tenant]) -> None:
+        token = tenancy.set_current(tenant) if tenant else None
+        try:
+            job()
+        except Exception:
+            logger.exception("定时任务失败 tenant=%s",
+                             tenant.user_id if tenant else "default")
+        finally:
+            if token is not None:
+                tenancy.reset_current(token)
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tenants))) as pool:
+        list(pool.map(_run_one, tenants))
 
 
 def _count_today_auto_sent() -> int:
@@ -95,7 +138,8 @@ def _stop_reason(result: dict) -> str | None:
 
 
 async def _run_followup_pass(label: str, inter_message_delay) -> dict:
-    if not _check_lock.acquire(blocking=False):
+    lock = _get_tenant_lock()
+    if not lock.acquire(blocking=False):
         logger.info("%s: another follow-up pass is already running", label)
         return {"skipped": "already_running"}
 
@@ -158,7 +202,7 @@ async def _run_followup_pass(label: str, inter_message_delay) -> dict:
         logger.error("%s error: %s", label, e, exc_info=True)
         return {"error": str(e)}
     finally:
-        _check_lock.release()
+        lock.release()
 
 
 async def check_followups():
@@ -175,8 +219,8 @@ def _check_followups_once():
 
 
 def run_check_followups():
-    """每个租户各检查一次到期跟进。"""
-    _run_for_tenants(_check_followups_once)
+    """每个租户并发检查一次到期跟进（互不阻塞）。"""
+    _run_for_tenants_parallel(_check_followups_once)
 
 
 def start_scheduler():
@@ -239,15 +283,18 @@ def _auto_batch_push_once():
 
 
 def run_auto_batch_push():
-    """每个租户各跑一次 10:00 自动跟进。"""
-    _run_for_tenants(_auto_batch_push_once)
+    """每个租户并发跑一次 10:00 自动跟进（互不阻塞）。"""
+    _run_for_tenants_parallel(_auto_batch_push_once)
+
+
+def _wal_checkpoint_once():
+    try:
+        with db_write() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except Exception as e:
+        logger.warning(f"WAL checkpoint failed: {e}")
 
 
 def _wal_checkpoint():
-    """Periodically checkpoint SQLite WAL to prevent unbounded growth."""
-    try:
-        from database import get_connection
-        conn = get_connection()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-    except Exception as e:
-        logger.warning(f"WAL checkpoint failed: {e}")
+    """Periodically checkpoint SQLite WAL across all tenants to prevent unbounded growth."""
+    _run_for_tenants(_wal_checkpoint_once)

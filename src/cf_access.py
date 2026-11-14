@@ -32,6 +32,20 @@ def enabled() -> bool:
     return bool(team_domain()) and os.getenv("CF_ACCESS_AUTO_LOGIN", "1") != "0"
 
 
+def _cache_get(token: str, now: float) -> Tuple[bool, Optional[str]]:
+    cached = _cache.get(token)
+    if cached and now - cached[0] < _CACHE_TTL:
+        return True, cached[1]
+    return False, None
+
+
+def _cache_put(token: str, now: float, email: Optional[str]) -> None:
+    _cache[token] = (now, email)
+    if len(_cache) > 500:
+        for key in list(_cache)[:250]:
+            _cache.pop(key, None)
+
+
 def identity_email(token: str) -> Optional[str]:
     """用 Cloudflare 的 cookie 换取邮箱；无效或网络失败返回 None。"""
     if not token:
@@ -41,9 +55,9 @@ def identity_email(token: str) -> Optional[str]:
         return None
 
     now = time.time()
-    cached = _cache.get(token)
-    if cached and now - cached[0] < _CACHE_TTL:
-        return cached[1]
+    hit, cached_email = _cache_get(token, now)
+    if hit:
+        return cached_email
 
     email: Optional[str] = None
     try:
@@ -58,9 +72,35 @@ def identity_email(token: str) -> Optional[str]:
     except Exception as exc:
         logger.warning("[cf-access] 校验失败: %s", exc)
 
-    _cache[token] = (now, email)
-    # 简单的缓存清理，避免无界增长
-    if len(_cache) > 500:
-        for key in list(_cache)[:250]:
-            _cache.pop(key, None)
+    _cache_put(token, now, email)
+    return email
+
+
+async def async_identity_email(token: str) -> Optional[str]:
+    """异步版本：用 Cloudflare 的 cookie 换取邮箱，避免阻塞 FastAPI 事件循环。"""
+    if not token:
+        return None
+    domain = team_domain()
+    if not domain:
+        return None
+
+    now = time.time()
+    hit, cached_email = _cache_get(token, now)
+    if hit:
+        return cached_email
+
+    email: Optional[str] = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False,
+                                     headers={"Cookie": f"{COOKIE_NAME}={token}"}) as client:
+            resp = await client.get(f"{domain}/cdn-cgi/access/get-identity")
+        if resp.status_code == 200:
+            data = resp.json()
+            email = (data.get("email") or "").strip().lower() or None
+        else:
+            logger.info("[cf-access] 身份校验返回 %s", resp.status_code)
+    except Exception as exc:
+        logger.warning("[cf-access] 校验失败: %s", exc)
+
+    _cache_put(token, now, email)
     return email

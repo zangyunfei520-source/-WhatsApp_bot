@@ -1,5 +1,7 @@
 data/
 logs/
+accounts.db
+accounts.db-*
 .env
 .venv/
 __pycache__/

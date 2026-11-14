@@ -1,0 +1,9 @@
+# Cloudflare Tunnel reference config for bots.xueai88.xyz
+# Copy to ~/.cloudflared/config.yml and replace <TUNNEL_UUID> with your tunnel UUID.
+tunnel: <TUNNEL_UUID>
+credentials-file: /home/nonroot/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: bots.xueai88.xyz
+    service: http://127.0.0.1:8000
+  - service: http_status:404

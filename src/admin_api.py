@@ -2,6 +2,7 @@
 Admin API endpoints for the management console.
 Provides JSON data for Dashboard, Customers, Conversations, Follow-ups, and Bridge Status.
 """
+import asyncio
 import json
 import logging
 import os
@@ -18,7 +19,10 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, File, Query, UploadFile
 
 from config import get_config, get_data_dir
-from database import get_connection, update_customer, get_daily_quota_usage
+from database import (
+    get_connection, update_customer, get_daily_quota_usage,
+    create_order_record, update_order_record, delete_order_record,
+)
 from qr_state import get_pending_qr, clear_pending_qr
 from bot_state import (
     is_paused, toggle_paused, set_paused,
@@ -81,10 +85,13 @@ async def save_setup(data: dict):
 
     # Write back
     lines = [f"{k}={v}" for k, v in existing.items()]
-    env_path.write_text("\n".join(lines) + "\n")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    # Set in current process
-    os.environ["LLM_API_KEY"] = api_key
+    # Refresh tenant env cache; only touch process-wide os.environ in single-tenant mode.
+    import tenancy
+    tenancy.invalidate_env(data_dir)
+    if tenancy.current() is None:
+        os.environ["LLM_API_KEY"] = api_key
 
     return {"ok": True}
 
@@ -271,57 +278,12 @@ async def cleanup_invalid_phones(data: dict):
 
     Actions:
       - "detect_only": return list without making changes
-      - "delete_safe": delete customers with invalid phones AND no conversations
+      - "delete_safe": delete customers with invalid phones AND no conversations/orders
       - "mark_inactive": mark customers with invalid phones as inactive (if they have conversations)
     """
+    from database import cleanup_invalid_phone_customers
     action = data.get("action", "detect_only")
-    conn = get_connection()
-
-    invalid = conn.execute(
-        """SELECT c.id, c.phone, c.name, c.status,
-                  (SELECT COUNT(*) FROM conversations WHERE customer_id=c.id) as conv_count
-           FROM customers c
-           WHERE c.phone GLOB '*[A-Za-z]*' AND c.phone NOT GLOB '+*'"""
-    ).fetchall()
-
-    result = {"action": action, "total_invalid": len(invalid)}
-
-    if action == "detect_only":
-        result["message"] = f"发现 {len(invalid)} 个无效号码。使用 action=delete_safe 或 action=mark_inactive 执行清理。"
-        return result
-
-    if action == "delete_safe":
-        to_delete = [r for r in invalid if r["conv_count"] == 0]
-        deleted_ids = []
-        for r in to_delete:
-            cid = r["id"]
-            conn.execute("DELETE FROM sent_followups WHERE customer_id=?", (cid,))
-            conn.execute("DELETE FROM follow_up_schedule WHERE customer_id=?", (cid,))
-            conn.execute("DELETE FROM conversations WHERE customer_id=?", (cid,))
-            conn.execute("DELETE FROM customers WHERE id=?", (cid,))
-            deleted_ids.append({"id": cid, "phone": r["phone"], "name": r["name"]})
-        conn.commit()
-        result["deleted_count"] = len(deleted_ids)
-        result["deleted"] = deleted_ids
-        result["skipped_count"] = len(invalid) - len(deleted_ids)
-        result["message"] = f"已删除 {len(deleted_ids)} 个无效号码客户（无对话记录），跳过 {result['skipped_count']} 个（有对话记录需手动处理）"
-        return result
-
-    if action == "mark_inactive":
-        updated_count = 0
-        for r in invalid:
-            conn.execute(
-                "UPDATE customers SET status='inactive', notes=COALESCE(notes,'') || ' [自动标记：电话号码无效]', updated_at=? WHERE id=?",
-                (datetime.now().isoformat(), r["id"]))
-            conn.execute("UPDATE follow_up_schedule SET active=0 WHERE customer_id=?", (r["id"],))
-            updated_count += 1
-        conn.commit()
-        result["marked_inactive"] = updated_count
-        result["message"] = f"已将 {updated_count} 个无效号码客户标记为 inactive，其跟进计划已全部暂停。"
-        return result
-
-    result["error"] = f"未知操作: {action}，支持 detect_only / delete_safe / mark_inactive"
-    return result
+    return await asyncio.to_thread(cleanup_invalid_phone_customers, action)
 
 
 @router.get("/customers/{customer_id}")
@@ -374,23 +336,13 @@ async def update_customer_status(customer_id: int, data: dict):
                 "SELECT * FROM customers WHERE phone=?", (new_phone,)
             ).fetchone()
             if existing and existing["id"] != customer_id:
-                conn = get_connection()
-                # Reassign all related data from existing customer to current customer
-                conn.execute("UPDATE conversations SET customer_id=? WHERE customer_id=?",
-                             (customer_id, existing["id"]))
-                conn.execute("UPDATE follow_up_schedule SET customer_id=? WHERE customer_id=?",
-                             (customer_id, existing["id"]))
-                conn.execute("UPDATE sent_followups SET customer_id=? WHERE customer_id=?",
-                             (customer_id, existing["id"]))
-                conn.execute("UPDATE orders SET customer_id=? WHERE customer_id=?",
-                             (customer_id, existing["id"]))
-                # Delete the old customer (frees the phone number)
-                conn.execute("DELETE FROM customers WHERE id=?", (existing["id"],))
-                conn.commit()
-                logger.info(
-                    f"Merged customer #{existing['id']} ({existing['name']}, {existing['phone']}) "
-                    f"into #{customer_id} — all related records reassigned, old record deleted"
-                )
+                from database import merge_customers
+                merged = merge_customers(customer_id, existing["id"])
+                if merged:
+                    logger.info(
+                        f"Merged customer #{existing['id']} ({existing['name']}, {existing['phone']}) "
+                        f"into #{customer_id} — all related records reassigned, old record deleted"
+                    )
                 # Now the phone is free — retry the update
                 try:
                     result = update_customer(row["phone"], new_phone=new_phone, **updates)
@@ -399,7 +351,7 @@ async def update_customer_status(customer_id: int, data: dict):
                 return {
                     "ok": True,
                     "customer": result,
-                    "merged_from": {
+                    "merged_from": merged or {
                         "id": existing["id"],
                         "name": existing["name"],
                         "phone": existing["phone"],
@@ -474,31 +426,25 @@ def _build_col_map(headers: list):
     return col_map, has_info_col
 
 
-@router.post("/customers/import")
-async def import_customers(file: UploadFile = File(...)):
-    filename = file.filename or ""
+def _import_customers_sync(filename: str, raw_bytes: bytes) -> dict:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-
     row_offset = 2  # default for CSV (header row 1, data from row 2)
 
     if ext == "csv":
-        content = (await file.read()).decode("utf-8-sig")
+        content = raw_bytes.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(content))
         rows = list(reader)
         if not rows:
             return {"error": "文件为空或无法解析"}
         headers = list(rows[0].keys())
     elif ext in ("xlsx", "xls"):
-        content = await file.read()
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True)
         ws = wb.active
-        # Read first 5 rows to find header row
         max_scan = min(5, ws.max_row or 5)
         preview_rows = []
         for row in ws.iter_rows(min_row=1, max_row=max_scan, values_only=True):
             preview_rows.append([str(c or "").strip() for c in row])
 
-        # Find best header row: the one with most known column matches
         best_row_idx = 0
         best_score = 0
         all_known = NAME_KEYS + PHONE_KEYS + EMAIL_KEYS + NOTES_KEYS + COMPANY_KEYS + INFO_KEYS
@@ -514,7 +460,7 @@ async def import_customers(file: UploadFile = File(...)):
             return {"error": "未找到可识别的表头列，请确保表格包含姓名/电话/客户具体信息等列"}
 
         headers = preview_rows[best_row_idx]
-        row_offset = best_row_idx + 2  # actual Excel row number of first data row
+        row_offset = best_row_idx + 2
         rows = [dict(zip(headers, [str(c or "") if c is not None else "" for c in row]))
                 for row in ws.iter_rows(min_row=row_offset, values_only=True)]
         wb.close()
@@ -529,96 +475,99 @@ async def import_customers(file: UploadFile = File(...)):
     if "phone" not in col_map and not has_info_col:
         return {"error": "未找到电话/手机列，请确保表头包含'电话'或'phone'列，或包含'客户具体信息'列"}
 
-    conn = get_connection()
+    from database import db_write
     imported = 0
     skipped = []
 
-    for i, row in enumerate(rows):
-        row_num = i + row_offset
-        if has_info_col:
-            info_raw = (row.get(col_map.get("info", ""), "") or "").strip()
-            parsed = _parse_info_field(info_raw)
-            phone_raw = parsed["phone"]
-            name = parsed["name"]
-            email = parsed["email"]
-        else:
-            phone_raw = (row.get(col_map.get("phone", ""), "") or "").strip()
-            name = (row.get(col_map.get("name", ""), "") or "").strip()
-            email = (row.get(col_map.get("email", ""), "") or "").strip()
+    with db_write() as conn:
+        for i, row in enumerate(rows):
+            row_num = i + row_offset
+            if has_info_col:
+                info_raw = (row.get(col_map.get("info", ""), "") or "").strip()
+                parsed = _parse_info_field(info_raw)
+                phone_raw = parsed["phone"]
+                name = parsed["name"]
+                email = parsed["email"]
+            else:
+                phone_raw = (row.get(col_map.get("phone", ""), "") or "").strip()
+                name = (row.get(col_map.get("name", ""), "") or "").strip()
+                email = (row.get(col_map.get("email", ""), "") or "").strip()
 
-        # Also try dedicated columns if they exist (override parsed values)
-        if "name" in col_map:
-            explicit_name = (row.get(col_map["name"], "") or "").strip()
-            if explicit_name:
-                name = explicit_name
-        if "email" in col_map:
-            explicit_email = (row.get(col_map["email"], "") or "").strip()
-            if explicit_email:
-                email = explicit_email
+            if "name" in col_map:
+                explicit_name = (row.get(col_map["name"], "") or "").strip()
+                if explicit_name:
+                    name = explicit_name
+            if "email" in col_map:
+                explicit_email = (row.get(col_map["email"], "") or "").strip()
+                if explicit_email:
+                    email = explicit_email
 
-        phone = ''.join(c for c in phone_raw if c.isdigit() or c == '+')
-        if not phone:
-            skipped.append({"row": row_num, "reason": "电话为空"})
-            continue
+            phone = ''.join(c for c in phone_raw if c.isdigit() or c == '+')
+            if not phone:
+                skipped.append({"row": row_num, "reason": "电话为空"})
+                continue
 
-        if not name:
-            skipped.append({"row": row_num, "reason": "姓名为空"})
-            continue
+            if not name:
+                skipped.append({"row": row_num, "reason": "姓名为空"})
+                continue
 
-        existing = conn.execute("SELECT id FROM customers WHERE phone=?", (phone,)).fetchone()
-        if existing:
-            skipped.append({"row": row_num, "reason": f"电话 {phone} 已存在"})
-            continue
+            existing = conn.execute("SELECT id FROM customers WHERE phone=?", (phone,)).fetchone()
+            if existing:
+                skipped.append({"row": row_num, "reason": f"电话 {phone} 已存在"})
+                continue
 
-        notes = (row.get(col_map.get("notes", ""), "") or "").strip()
-        company = (row.get(col_map.get("company", ""), "") or "").strip()
+            notes = (row.get(col_map.get("notes", ""), "") or "").strip()
+            company = (row.get(col_map.get("company", ""), "") or "").strip()
 
-        try:
-            conn.execute(
-                "INSERT INTO customers(phone, name, email, company, notes) VALUES(?,?,?,?,?)",
-                (phone, name, email, company, notes))
-            conn.commit()
-            imported += 1
-        except Exception as e:
-            skipped.append({"row": row_num, "reason": f"写入失败: {str(e)}"})
+            try:
+                conn.execute(
+                    "INSERT INTO customers(phone, name, email, company, notes) VALUES(?,?,?,?,?)",
+                    (phone, name, email, company, notes))
+                imported += 1
+            except Exception as e:
+                skipped.append({"row": row_num, "reason": f"写入失败: {str(e)}"})
 
     return {"imported": imported, "skipped": skipped, "total": len(rows)}
+
+
+@router.post("/customers/import")
+async def import_customers(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    raw_bytes = await file.read()
+    if len(raw_bytes) > 20 * 1024 * 1024:
+        return {"error": "导入文件过大（最大 20MB）"}
+    return await asyncio.to_thread(_import_customers_sync, filename, raw_bytes)
 
 
 # ── Conversations ──────────────────────────────────────────────────────────────
 
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: int):
-    conn = get_connection()
-    row = conn.execute("SELECT id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
-    if not row:
-        return {"error": "not found"}
-    conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
-    conn.commit()
+    from database import db_write
+    with db_write() as conn:
+        row = conn.execute("SELECT id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
     return {"ok": True}
 
 
 @router.delete("/customers/{customer_id}")
 async def delete_customer(customer_id: int):
-    """Delete a customer and all related records (conversations, followup schedule, sent followups)."""
-    conn = get_connection()
-    row = conn.execute("SELECT id, name, phone FROM customers WHERE id=?", (customer_id,)).fetchone()
-    if not row:
+    """Delete a customer and all related records (conversations, followup schedule, orders, scores, memory)."""
+    from database import delete_customer_cascade
+    deleted = delete_customer_cascade(customer_id)
+    if not deleted:
         return {"ok": False, "error": "客户不存在"}
-    conn.execute("DELETE FROM sent_followups WHERE customer_id=?", (customer_id,))
-    conn.execute("DELETE FROM follow_up_schedule WHERE customer_id=?", (customer_id,))
-    conn.execute("DELETE FROM conversations WHERE customer_id=?", (customer_id,))
-    conn.execute("DELETE FROM customers WHERE id=?", (customer_id,))
-    conn.commit()
-    logger.info(f"Deleted customer #{customer_id}: {row['name']} ({row['phone']}) — all related records removed")
-    return {"ok": True, "deleted": {"id": customer_id, "name": row["name"], "phone": row["phone"]}}
+    logger.info(f"Deleted customer #{customer_id}: {deleted['name']} ({deleted['phone']}) — all related records removed")
+    return {"ok": True, "deleted": deleted}
 
 
 @router.delete("/customers/{customer_id}/conversations")
 async def delete_customer_conversations(customer_id: int):
-    conn = get_connection()
-    conn.execute("DELETE FROM conversations WHERE customer_id=?", (customer_id,))
-    conn.commit()
+    from database import db_write
+    with db_write() as conn:
+        conn.execute("DELETE FROM conversations WHERE customer_id=?", (customer_id,))
     return {"ok": True}
 
 
@@ -722,13 +671,13 @@ async def followups_by_date(date: str = Query(...)):
 
 @router.post("/followups/{schedule_id}/toggle")
 async def toggle_followup(schedule_id: int):
-    conn = get_connection()
-    row = conn.execute("SELECT active FROM follow_up_schedule WHERE id=?", (schedule_id,)).fetchone()
-    if not row:
-        return {"error": "not found"}
-    new_active = 0 if row["active"] else 1
-    conn.execute("UPDATE follow_up_schedule SET active=? WHERE id=?", (new_active, schedule_id))
-    conn.commit()
+    from database import db_write
+    with db_write() as conn:
+        row = conn.execute("SELECT active FROM follow_up_schedule WHERE id=?", (schedule_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        new_active = 0 if row["active"] else 1
+        conn.execute("UPDATE follow_up_schedule SET active=? WHERE id=?", (new_active, schedule_id))
     return {"ok": True, "active": new_active}
 
 
@@ -800,52 +749,22 @@ async def send_manual(data: dict):
 @router.post("/followups/add-to-batch")
 async def add_customer_to_batch(data: dict):
     """Add a customer to followup schedule for batch push."""
-    from database import ensure_followup_schedule
+    from database import ensure_active_batch_schedule
     customer_id = data.get("customer_id")
     if not customer_id:
         return {"error": "customer_id required"}
-    conn = get_connection()
-    # Ensure customer exists
-    cust = conn.execute("SELECT id, name, phone, status FROM customers WHERE id=?", (customer_id,)).fetchone()
-    if not cust:
-        return {"error": "customer not found"}
-    if cust["status"] not in ("active", "inactive"):
-        return {"error": f"customer status is {cust['status']}"}
-    # If customer is inactive, set back to active
-    if cust["status"] == "inactive":
-        conn.execute("UPDATE customers SET status='active', updated_at=? WHERE id=?", (datetime.now().isoformat(), customer_id))
-        conn.commit()
-    # Create/activate followup schedule with next_followup_at=now so it appears immediately
-    conn.execute(
-        "INSERT INTO follow_up_schedule(customer_id, frequency_days, next_followup_at, active) "
-        "VALUES(?, 7, ?, 1) "
-        "ON CONFLICT DO NOTHING",
-        (customer_id, datetime.now().isoformat())
-    )
-    # Also ensure any inactive schedule is reactivated
-    conn.execute(
-        "UPDATE follow_up_schedule SET active=1 WHERE customer_id=? AND active=0",
-        (customer_id,)
-    )
-    conn.commit()
-    # Fetch the schedule
-    sched = conn.execute(
-        "SELECT fs.*, c.name, c.phone, c.company FROM follow_up_schedule fs "
-        "JOIN customers c ON fs.customer_id=c.id WHERE fs.customer_id=? AND fs.active=1",
-        (customer_id,)
-    ).fetchone()
-    return {"ok": True, "schedule": dict(sched) if sched else None}
+    return ensure_active_batch_schedule(int(customer_id))
 
 
 @router.post("/followups/{schedule_id}/remove-from-batch")
 async def remove_customer_from_batch(schedule_id: int):
     """Remove a customer from the batch by deactivating their followup schedule."""
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM follow_up_schedule WHERE id=?", (schedule_id,)).fetchone()
-    if not row:
-        return {"error": "not found"}
-    conn.execute("UPDATE follow_up_schedule SET active=0 WHERE id=?", (schedule_id,))
-    conn.commit()
+    from database import db_write
+    with db_write() as conn:
+        row = conn.execute("SELECT id FROM follow_up_schedule WHERE id=?", (schedule_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        conn.execute("UPDATE follow_up_schedule SET active=0 WHERE id=?", (schedule_id,))
     return {"ok": True}
 
 
@@ -981,53 +900,66 @@ async def create_product_doc(data: dict):
     content = (data.get("content") or "").strip()
     if not title:
         return {"error": "title required"}
-    conn = get_connection()
-    cur = conn.execute(
-        "INSERT INTO product_docs(title, content) VALUES(?,?)", (title, content))
-    conn.commit()
-    row = conn.execute("SELECT * FROM product_docs WHERE id=?", (cur.lastrowid,)).fetchone()
+    from database import db_write
+    with db_write() as conn:
+        cur = conn.execute(
+            "INSERT INTO product_docs(title, content) VALUES(?,?)", (title, content))
+        row = conn.execute("SELECT * FROM product_docs WHERE id=?", (cur.lastrowid,)).fetchone()
     return {"ok": True, "doc": dict(row)}
 
 
 @router.put("/product-docs/{doc_id}")
 async def update_product_doc(doc_id: int, data: dict):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM product_docs WHERE id=?", (doc_id,)).fetchone()
-    if not row:
-        return {"error": "not found"}
-    title = data.get("title", row["title"])
-    content = data.get("content", row["content"])
-    conn.execute(
-        "UPDATE product_docs SET title=?, content=?, updated_at=? WHERE id=?",
-        (title, content, datetime.now().isoformat(), doc_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM product_docs WHERE id=?", (doc_id,)).fetchone()
-    return {"ok": True, "doc": dict(row)}
+    from database import db_write
+    with db_write() as conn:
+        row = conn.execute("SELECT * FROM product_docs WHERE id=?", (doc_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        title = data.get("title", row["title"])
+        content = data.get("content", row["content"])
+        conn.execute(
+            "UPDATE product_docs SET title=?, content=?, updated_at=? WHERE id=?",
+            (title, content, datetime.now().isoformat(), doc_id))
+        updated = conn.execute("SELECT * FROM product_docs WHERE id=?", (doc_id,)).fetchone()
+    return {"ok": True, "doc": dict(updated)}
 
 
 @router.delete("/product-docs/{doc_id}")
 async def delete_product_doc(doc_id: int):
-    conn = get_connection()
-    conn.execute("DELETE FROM product_docs WHERE id=?", (doc_id,))
-    conn.commit()
+    from database import db_write
+    with db_write() as conn:
+        conn.execute("DELETE FROM product_docs WHERE id=?", (doc_id,))
     return {"ok": True}
 
 
-@router.post("/product-docs/upload")
-async def upload_product_docs(files: list[UploadFile] = File(...)):
-    conn = get_connection()
+_MAX_DOC_BYTES = 50 * 1024 * 1024
+
+
+def _process_uploaded_docs_sync(file_items: list[tuple[str, bytes]]) -> dict:
+    from database import db_write, save_product_file
+
     imported = []
     failed = []
+    mime_map = {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls": "application/vnd.ms-excel",
+        "csv": "text/csv",
+        "txt": "text/plain", "md": "text/markdown",
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+    }
 
-    for file in files:
-        filename = file.filename or "untitled"
+    for filename, content_bytes in file_items:
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
+        if len(content_bytes) > _MAX_DOC_BYTES:
+            failed.append({"filename": filename, "reason": "文件过大（最大 50MB）"})
+            continue
 
         try:
-            content_bytes = await file.read()
             content = ""
-
             if ext in ("txt", "md", "markdown"):
                 content = content_bytes.decode("utf-8-sig")
             elif ext == "pdf":
@@ -1045,14 +977,13 @@ async def upload_product_docs(files: list[UploadFile] = File(...)):
                     if t:
                         parts.append(t)
                 content = "\n\n".join(parts)
-                # OCR fallback for scanned PDFs
                 if not content.strip():
                     try:
                         import fitz
                         ocr = _get_ocr()
                         doc = fitz.open(stream=content_bytes, filetype="pdf")
                         ocr_parts = []
-                        for i, page in enumerate(doc):
+                        for page in doc:
                             pix = page.get_pixmap(dpi=150)
                             img_bytes = pix.tobytes("png")
                             out = ocr(img_bytes)
@@ -1077,7 +1008,6 @@ async def upload_product_docs(files: list[UploadFile] = File(...)):
                         if row_text.strip():
                             lines.append(row_text)
                 content = "\n".join(lines)
-                # OCR fallback for scanned/image-based docx
                 if not content.strip():
                     try:
                         ocr = _get_ocr()
@@ -1143,29 +1073,28 @@ async def upload_product_docs(files: list[UploadFile] = File(...)):
                 failed.append({"filename": filename, "reason": "无法提取文本内容，文件可能为扫描版或空白"})
                 continue
 
-            cur = conn.execute(
-                "INSERT INTO product_docs(title, content) VALUES(?,?)",
-                (title, content[:200000]))
-            conn.commit()
-            # ── Store original binary for WhatsApp document sending ──
-            mime_map = {
-                "pdf": "application/pdf",
-                "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "xls": "application/vnd.ms-excel",
-                "csv": "text/csv",
-                "txt": "text/plain", "md": "text/markdown",
-                "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
-            }
+            with db_write() as conn:
+                cur = conn.execute(
+                    "INSERT INTO product_docs(title, content) VALUES(?,?)",
+                    (title, content[:200000]))
+                doc_id = cur.lastrowid
             mime_type = mime_map.get(ext, "application/octet-stream")
-            from database import save_product_file
-            save_product_file(cur.lastrowid, filename, mime_type, content_bytes)
-            imported.append({"id": cur.lastrowid, "title": title})
+            save_product_file(doc_id, filename, mime_type, content_bytes)
+            imported.append({"id": doc_id, "title": title})
         except Exception as e:
             failed.append({"filename": filename, "reason": f"解析失败: {str(e)}"})
 
     return {"imported": imported, "failed": failed}
+
+
+@router.post("/product-docs/upload")
+async def upload_product_docs(files: list[UploadFile] = File(...)):
+    file_items: list[tuple[str, bytes]] = []
+    for file in files:
+        filename = file.filename or "untitled"
+        content_bytes = await file.read()
+        file_items.append((filename, content_bytes))
+    return await asyncio.to_thread(_process_uploaded_docs_sync, file_items)
 
 
 # ── QR Code ────────────────────────────────────────────────────────────────────
@@ -1186,6 +1115,13 @@ async def clear_qr():
 
 # ── Bridge ─────────────────────────────────────────────────────────────────────
 
+def _tail_lines(path: Path, max_lines: int) -> list[str]:
+    """Read up to the last ``max_lines`` lines without loading huge log files completely."""
+    from collections import deque
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        return [line.rstrip("\n") for line in deque(fh, maxlen=max_lines)]
+
+
 @router.post("/bridge/start")
 async def bridge_start():
     """为当前租户拉起一个独立的 bridge 进程（已运行则复用）。"""
@@ -1196,7 +1132,7 @@ async def bridge_start():
     if tenant is None:
         return {"ok": False, "error": "需要登录"}
     try:
-        result = bridge_manager.start(tenant)
+        result = await asyncio.to_thread(bridge_manager.start, tenant)
     except Exception as exc:
         logger.warning("bridge 启动失败: %s", exc)
         return {"ok": False, "error": str(exc)}
@@ -1211,22 +1147,15 @@ async def bridge_stop():
     tenant = tenancy.current()
     if tenant is None:
         return {"ok": False, "error": "需要登录"}
-    bridge_manager.stop(tenant.user_id)
+    await asyncio.to_thread(bridge_manager.stop, tenant.user_id)
     return {"ok": True}
 
 
-@router.get("/bridge")
-async def bridge_status():
-    status = await _get_bridge_status()
-    status["qr_pending"] = get_pending_qr() is not None
-    # Read recent bridge log entries from the same data-dir logs as /activity.
+def _read_bridge_events_sync(paths: list[Path]) -> list[str]:
     bridge_events = []
     try:
-        for path in _activity_log_candidates():
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
-            for line in lines[-400:]:
-                line = line.rstrip("\n")
+        for path in paths:
+            for line in _tail_lines(path, 400):
                 if "Bridge not started" in line:
                     continue
                 if any(k in line for k in ("WHATSAPP_READY", "WHATSAPP_DISCONNECTED",
@@ -1235,10 +1164,18 @@ async def bridge_status():
         bridge_events.sort(key=lambda line: line[:19])
     except Exception:
         pass
+    return bridge_events[-20:]
 
+
+@router.get("/bridge")
+async def bridge_status():
+    status = await _get_bridge_status()
+    status["qr_pending"] = get_pending_qr() is not None
+    paths = _activity_log_candidates()
+    bridge_events = await asyncio.to_thread(_read_bridge_events_sync, paths)
     return {
         **status,
-        "recent_events": bridge_events[-20:],
+        "recent_events": bridge_events,
     }
 
 
@@ -1300,16 +1237,35 @@ async def set_proxy(data: dict):
     data_dir = get_data_dir()
     config_path = data_dir / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     else:
         raw = {}
     raw.setdefault("bridge", {})["proxy"] = proxy_url
     config_path.write_text(yaml.dump(raw, allow_unicode=True, default_flow_style=False), encoding="utf-8")
-    # Reload config
-    from config import load_config
-    load_config(str(config_path))
-    # Notify bridge to reconnect via env var — bridge needs restart to pick up new proxy
-    return {"ok": True, "proxy": proxy_url, "note": "代理已保存。请重启应用或重新扫码以使新代理生效。"}
+    # Reload only the current tenant/global config cache without leaking into global _config.
+    from config import reload_current_config
+    reload_current_config(config_path)
+
+    # Restart running tenant bridge so the updated proxy env takes effect immediately.
+    import bridge_manager
+    import tenancy
+    tenant = tenancy.current()
+    restarted = False
+    restart_error = None
+    if tenant is not None and bridge_manager.status(tenant).get("running"):
+        try:
+            await asyncio.to_thread(bridge_manager.restart, tenant)
+            restarted = True
+        except Exception as exc:
+            restart_error = str(exc)
+            logger.warning("代理更新后重启 bridge 失败: %s", exc)
+
+    note = (
+        "代理已保存并已重启 Bridge 使其生效。" if restarted
+        else (f"代理已保存，但重启 Bridge 失败：{restart_error}" if restart_error
+              else "代理已保存，启动 Bridge 后将自动生效。")
+    )
+    return {"ok": True, "proxy": proxy_url, "restarted": restarted, "note": note}
 
 
 # ── Bot Pause/Resume ───────────────────────────────────────────────────────────
@@ -1483,31 +1439,31 @@ async def agent_customer_analysis(customer_id: int):
     from intent_analyzer import analyze_conversation_intent
     from database import get_customer_memory, get_customer_decisions
 
-    score_data = score_customer(customer_id)
-    intent_data = analyze_conversation_intent(customer_id)
-    memory = get_customer_memory(customer_id, limit=10)
-    decisions = get_customer_decisions(customer_id, limit=20)
+    def _compute():
+        score_data = score_customer(customer_id)
+        intent_data = analyze_conversation_intent(customer_id)
+        memory = get_customer_memory(customer_id, limit=10)
+        decisions = get_customer_decisions(customer_id, limit=20)
+        customer = get_connection().execute(
+            "SELECT * FROM customers WHERE id=?", (customer_id,)
+        ).fetchone()
+        return {
+            "customer": dict(customer) if customer else None,
+            "computed_at": datetime.now().isoformat(),
+            "score": score_data,
+            "intent": intent_data,
+            "memory": [dict(m) for m in memory],
+            "decisions": [dict(d) for d in decisions],
+        }
 
-    # Customer info
-    customer = get_connection().execute(
-        "SELECT * FROM customers WHERE id=?", (customer_id,)
-    ).fetchone()
-
-    return {
-        "customer": dict(customer) if customer else None,
-        "computed_at": datetime.now().isoformat(),
-        "score": score_data,
-        "intent": intent_data,
-        "memory": [dict(m) for m in memory],
-        "decisions": [dict(d) for d in decisions],
-    }
+    return await asyncio.to_thread(_compute)
 
 
 @router.post("/agent/run-scoring")
 async def trigger_scoring():
     """Manually trigger a full re-scoring of all customers."""
     from scoring_engine import score_all_customers
-    result = score_all_customers()
+    result = await asyncio.to_thread(score_all_customers)
     return {"ok": True, "result": result}
 
 
@@ -1515,7 +1471,7 @@ async def trigger_scoring():
 async def trigger_strategy_eval():
     """Manually trigger strategy evaluation for all customers."""
     from strategy_manager import evaluate_all_strategies
-    result = evaluate_all_strategies()
+    result = await asyncio.to_thread(evaluate_all_strategies)
     return {"ok": True, "result": result}
 
 
@@ -1531,6 +1487,7 @@ def _activity_log_candidates() -> list[Path]:
     """
     data_dir = get_data_dir()
     candidates = [
+        data_dir / "logs" / "bridge.log",
         data_dir / "logs" / "backend.log",
         data_dir / "logs" / "web.log",
         data_dir / "logs" / "bot.log",
@@ -1548,21 +1505,19 @@ def _activity_log_candidates() -> list[Path]:
 
 @router.get("/activity")
 async def activity_log(lines: int = Query(100, ge=10, le=500)):
-    from collections import deque
     paths = _activity_log_candidates()
     if not paths:
         return {"lines": [], "source": None,
                 "error": "未找到日志文件（backend.log/web.log/bot.log）"}
-    try:
+
+    def _read_and_filter() -> list[str]:
         log_lines = []
+        max_raw = min(max(lines * 20, 1000), 10000)
         for log_path in paths:
-            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-                log_lines.extend(deque(fh, maxlen=min(max(lines * 20, 1000), 10000)))
-        # Filter to INFO and above, skip DEBUG
-        filtered = [l.rstrip("\n") for l in log_lines
+            log_lines.extend(_tail_lines(log_path, max_raw))
+        filtered = [l for l in log_lines
                     if ("[DEBUG]" not in l
                         and ("[INFO]" in l or "[ERROR]" in l or "[CRITICAL]" in l or "[WARNING]" in l))]
-        # Filter out QR code Unicode block-art lines (between QR_RECEIVED and QR_END)
         in_qr = False
         clean = []
         for l in filtered:
@@ -1577,7 +1532,11 @@ async def activity_log(lines: int = Query(100, ge=10, le=500)):
             if not in_qr:
                 clean.append(l)
         clean.sort(key=lambda line: line[:19])
-        return {"lines": clean[-lines:], "source": ", ".join(str(p) for p in paths)}
+        return clean[-lines:]
+
+    try:
+        result_lines = await asyncio.to_thread(_read_and_filter)
+        return {"lines": result_lines, "source": ", ".join(str(p) for p in paths)}
     except Exception as e:
         return {"lines": [], "source": ", ".join(str(p) for p in paths), "error": str(e)}
 
@@ -1647,79 +1606,22 @@ async def order_detail(order_id: int):
 
 @router.post("/orders")
 async def create_order(data: dict):
-    conn = get_connection()
     customer_id = data.get("customer_id")
     if not customer_id:
         return {"error": "customer_id required"}
-    customer = conn.execute("SELECT id FROM customers WHERE id=?", (customer_id,)).fetchone()
-    if not customer:
-        return {"error": "customer not found"}
-
-    # Generate order_no: TP + YYYYMMDD + 3-digit seq
-    today = datetime.now().strftime("%Y%m%d")
-    prefix = f"TP{today}"
-    last = conn.execute(
-        "SELECT order_no FROM orders WHERE order_no LIKE ? ORDER BY order_no DESC LIMIT 1",
-        (f"{prefix}%",)
-    ).fetchone()
-    if last:
-        seq = int(last["order_no"][-3:]) + 1
-    else:
-        seq = 1
-    order_no = f"{prefix}{seq:03d}"
-
-    order_date = data.get("order_date", today)
-    delivery_date = data.get("delivery_date", "")
-    if order_date and delivery_date and order_date > delivery_date:
-        return {"error": "下单日期不能晚于交付日期"}
-    now = datetime.now().isoformat()
-    conn.execute(
-        """INSERT INTO orders(order_no, customer_id, product, quantity, unit_price, total_amount,
-           status, order_date, delivery_date, notes, currency, created_at, updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (order_no, customer_id, data.get("product", ""), data.get("quantity", 1),
-         data.get("unit_price"), data.get("total_amount"),
-         data.get("status", "pending"), order_date,
-         delivery_date, data.get("notes", ""), data.get("currency", "USD"), now, now)
-    )
-    conn.commit()
-    row = conn.execute("SELECT o.*, c.name as customer_name FROM orders o JOIN customers c ON o.customer_id=c.id WHERE o.order_no=?", (order_no,)).fetchone()
-    return {"ok": True, "order": dict(row)}
+    return await asyncio.to_thread(create_order_record, int(customer_id), data)
 
 
 @router.put("/orders/{order_id}")
 async def update_order(order_id: int, data: dict):
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-    if not row:
-        return {"error": "not found"}
-
-    allowed = {"order_no", "customer_id", "product", "quantity", "unit_price", "total_amount",
-               "status", "order_date", "delivery_date", "notes", "currency"}
-    updates = {k: v for k, v in data.items() if k in allowed}
-    if not updates:
-        return {"error": "no valid fields"}
-    # Validate date order: only fall back to DB if key not in request at all
-    new_order_date = updates["order_date"] if "order_date" in updates else row["order_date"]
-    new_delivery_date = updates["delivery_date"] if "delivery_date" in updates else row["delivery_date"]
-    if new_order_date and new_delivery_date and new_order_date > new_delivery_date:
-        return {"error": "下单日期不能晚于交付日期"}
-    updates["updated_at"] = datetime.now().isoformat()
-    set_clause = ", ".join(f"{k}=?" for k in updates)
-    conn.execute(f"UPDATE orders SET {set_clause} WHERE id=?", list(updates.values()) + [order_id])
-    conn.commit()
-    row = conn.execute("SELECT o.*, c.name as customer_name FROM orders o JOIN customers c ON o.customer_id=c.id WHERE o.id=?", (order_id,)).fetchone()
-    return {"ok": True, "order": dict(row)}
+    return await asyncio.to_thread(update_order_record, order_id, data)
 
 
 @router.delete("/orders/{order_id}")
 async def delete_order(order_id: int):
-    conn = get_connection()
-    row = conn.execute("SELECT id FROM orders WHERE id=?", (order_id,)).fetchone()
-    if not row:
+    deleted = await asyncio.to_thread(delete_order_record, order_id)
+    if not deleted:
         return {"error": "not found"}
-    conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
-    conn.commit()
     return {"ok": True}
 
 

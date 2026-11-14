@@ -13,6 +13,7 @@ tenant_id，也不需要给 55 个接口加过滤条件。
 from __future__ import annotations
 
 import os
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,13 +93,15 @@ def ensure_tenant_dir(user_id: str, template: Optional[Path] = None) -> Path:
 # 泄漏给 B 用户。这里按目录缓存，只在本租户的请求里返回。
 
 _env_cache: Dict[str, Dict[str, str]] = {}
+_env_lock = threading.RLock()
 
 
 def load_tenant_env(data_dir: Path) -> Dict[str, str]:
     key = str(data_dir)
-    cached = _env_cache.get(key)
-    if cached is not None:
-        return cached
+    with _env_lock:
+        cached = _env_cache.get(key)
+        if cached is not None:
+            return cached
 
     values: Dict[str, str] = {}
     env_file = data_dir / ".env"
@@ -115,9 +118,11 @@ def load_tenant_env(data_dir: Path) -> Dict[str, str]:
                     values[k] = v
         except OSError:
             values = {}
-    _env_cache[key] = values
+    with _env_lock:
+        _env_cache[key] = values
     return values
 
 
 def invalidate_env(data_dir: Path) -> None:
-    _env_cache.pop(str(data_dir), None)
+    with _env_lock:
+        _env_cache.pop(str(data_dir), None)

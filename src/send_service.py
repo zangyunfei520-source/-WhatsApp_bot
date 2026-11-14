@@ -22,6 +22,7 @@ Rules
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -296,7 +297,7 @@ async def send_followup_now(schedule_id: int, *, manual: bool = False,
     bridge = None
     quota_finalized = False
     try:
-        message = _message_for_target(target, target.get("strategy"))
+        message = await asyncio.to_thread(_message_for_target, target, target.get("strategy"))
 
         # Pause/switch/status can change while the LLM is generating. Re-check
         # immediately before touching the bridge.

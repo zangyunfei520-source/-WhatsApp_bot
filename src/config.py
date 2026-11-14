@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -167,6 +168,7 @@ class Config(BaseModel):
 
 _config: Optional[Config] = None
 _config_cache: dict[str, Config] = {}
+_config_lock = threading.RLock()
 
 
 def _read_config_file(path: Path, tenant_env: Optional[dict] = None) -> Config:
@@ -192,9 +194,31 @@ def load_config(config_path: str = "config.yaml") -> Config:
             path = data_config
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    _config = _read_config_file(path)
-    _config_cache[str(path.resolve())] = _config
-    return _config
+    cfg = _read_config_file(path)
+    with _config_lock:
+        _config = cfg
+        _config_cache[str(path.resolve())] = cfg
+    return cfg
+
+
+def invalidate_config_cache(config_path: Optional[Path] = None) -> None:
+    with _config_lock:
+        if config_path is None:
+            _config_cache.clear()
+            return
+        _config_cache.pop(str(Path(config_path).resolve()), None)
+
+
+def reload_current_config(config_path: Optional[Path] = None) -> Config:
+    """刷新当前上下文（租户或全局）的配置缓存，不让单租户配置污染全局 _config。"""
+    from tenancy import current
+    tenant = current()
+    if tenant is not None:
+        invalidate_config_cache(config_path or tenant.config_path)
+        return get_config()
+    if config_path is not None:
+        return load_config(str(config_path))
+    return load_config()
 
 
 def get_config() -> Config:
@@ -204,7 +228,8 @@ def get_config() -> Config:
     tenant = current()
     if tenant is not None:
         key = str(tenant.config_path.resolve())
-        cfg = _config_cache.get(key)
+        with _config_lock:
+            cfg = _config_cache.get(key)
         if cfg is not None:
             return cfg
 
@@ -216,13 +241,16 @@ def get_config() -> Config:
                     tenant.config_path, load_tenant_env(tenant.data_dir))
             finally:
                 reset_current(token)
-            _config_cache[key] = cfg
+            with _config_lock:
+                _config_cache[key] = cfg
             return cfg
 
+        with _config_lock:
+            if _config is None:
+                raise RuntimeError("Config not loaded. Call load_config() first.")
+            return _config
+
+    with _config_lock:
         if _config is None:
             raise RuntimeError("Config not loaded. Call load_config() first.")
         return _config
-
-    if _config is None:
-        raise RuntimeError("Config not loaded. Call load_config() first.")
-    return _config

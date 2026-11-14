@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -31,6 +34,8 @@ _PORT_MAX = 3999
 _lock = threading.RLock()
 _procs: Dict[str, subprocess.Popen] = {}
 _ports: Dict[str, int] = {}
+_pids: Dict[str, int] = {}
+_tokens: Dict[str, str] = {}
 # 用户主动启动过的租户才需要看门狗拉起；崩溃重启次数用于防止无限重启
 _enabled: Dict[str, bool] = {}
 _restarts: Dict[str, list] = {}
@@ -52,9 +57,17 @@ def _load_registry() -> None:
     except Exception:
         return
     for tenant_id, info in (data or {}).items():
+        if not isinstance(info, dict):
+            continue
         port = info.get("port")
         if isinstance(port, int):
             _ports.setdefault(tenant_id, port)
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid > 0:
+            _pids.setdefault(tenant_id, pid)
+        token = info.get("token")
+        if isinstance(token, str) and token:
+            _tokens.setdefault(tenant_id, token)
         if info.get("enabled"):
             _enabled[tenant_id] = True
 
@@ -63,7 +76,12 @@ def _save_registry() -> None:
     path = _registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        tid: {"port": port, "enabled": bool(_enabled.get(tid))}
+        tid: {
+            "port": port,
+            "enabled": bool(_enabled.get(tid)),
+            "pid": _pids.get(tid),
+            "token": _tokens.get(tid),
+        }
         for tid, port in _ports.items()
     }
     tmp = path.with_suffix(".tmp")
@@ -72,6 +90,65 @@ def _save_registry() -> None:
 
 
 _load_registry()
+
+
+def _pid_is_bridge(pid: Optional[int]) -> bool:
+    """Best-effort check that a recorded PID is alive and is our bridge process."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        proc_cmd = Path(f"/proc/{pid}/cmdline")
+        if proc_cmd.exists():
+            cmd = proc_cmd.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            return "bridge/index.js" in cmd or "bridge\\index.js" in cmd
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=1.5,
+        )
+        if res.returncode == 0:
+            return "bridge/index.js" in res.stdout or "bridge\\index.js" in res.stdout
+    except Exception:
+        pass
+    return False
+
+
+def _terminate_pid(pid: Optional[int]) -> None:
+    if not _pid_is_bridge(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def verify_bridge_token(tenant_id: str, presented: Optional[str]) -> bool:
+    """Verify X-Bridge-Token for webhook callbacks.
+
+    If WA_WEBHOOK_SECRET is configured, or bridge_manager issued a token for this
+    tenant, require an exact constant-time match.
+    """
+    global_secret = (os.getenv("WA_WEBHOOK_SECRET") or "").strip()
+    if global_secret:
+        return hmac.compare_digest(global_secret, presented or "")
+    expected = _tokens.get(tenant_id)
+    if not expected:
+        return True
+    return hmac.compare_digest(expected, presented or "")
 
 
 # ── 端口 ────────────────────────────────────────────────────────────────
@@ -152,10 +229,13 @@ def _node_bin() -> str:
 
 
 def _api_port() -> int:
+    env_port = (os.getenv("API_PORT") or "").strip()
+    if env_port.isdigit():
+        return int(env_port)
     try:
         return get_config().api.port
     except Exception:
-        return int(os.getenv("API_PORT", "8000") or 8000)
+        return 8000
 
 
 def _log_path(data_dir: Path) -> Path:
@@ -178,13 +258,25 @@ def start(tenant: Tenant) -> dict:
         if not (ROOT / "bridge" / "node_modules").exists():
             raise RuntimeError("bridge 依赖未安装：npm --prefix bridge install")
 
+        # 清理可能残留的孤儿 bridge 进程，防止双实例竞争同一 .baileys-auth 目录
+        if proc is None:
+            _terminate_pid(_pids.pop(tenant.user_id, None))
+        elif proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
         port = _ports.get(tenant.user_id)
         if not port or not _port_free(port):
             port = _allocate_port()
+        token = _tokens.get(tenant.user_id) or secrets.token_urlsafe(24)
         env = os.environ.copy()
         env.update({
             "WHATSAPP_BOT_DATA_DIR": str(tenant.data_dir),
             "WA_TENANT_ID": tenant.user_id,
+            "WA_BRIDGE_TOKEN": token,
             "BRIDGE_PORT": str(port),
             "BRIDGE_HOST": "127.0.0.1",
             "PYTHON_API": f"http://127.0.0.1:{_api_port()}",
@@ -200,14 +292,16 @@ def start(tenant: Tenant) -> dict:
             env["HTTPS_PROXY"] = env["https_proxy"] = proxy
             env["HTTP_PROXY"] = env["http_proxy"] = proxy
 
-        log = open(_log_path(tenant.data_dir), "a", encoding="utf-8")
-        proc = subprocess.Popen(
-            [_node_bin(), str(ROOT / "bridge" / "index.js")],
-            cwd=str(ROOT), env=env,
-            stdout=log, stderr=subprocess.STDOUT,
-        )
+        with open(_log_path(tenant.data_dir), "a", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                [_node_bin(), str(ROOT / "bridge" / "index.js")],
+                cwd=str(ROOT), env=env,
+                stdout=log, stderr=subprocess.STDOUT,
+            )
         _procs[tenant.user_id] = proc
         _ports[tenant.user_id] = port
+        _pids[tenant.user_id] = proc.pid
+        _tokens[tenant.user_id] = token
         _enabled[tenant.user_id] = True
         _save_registry()
 
@@ -225,19 +319,31 @@ def start(tenant: Tenant) -> dict:
         return {"online": _alive(port), "port": port, "pid": proc.pid, "started": True}
 
 
-def stop(tenant_id: str) -> None:
+def stop(tenant_id: str, preserve_port: bool = False) -> None:
     with _lock:
         proc = _procs.pop(tenant_id, None)
+        old_pid = _pids.pop(tenant_id, None)
         if proc and proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        _ports.pop(tenant_id, None)
+        elif old_pid:
+            _terminate_pid(old_pid)
+        if not preserve_port:
+            _ports.pop(tenant_id, None)
+            _tokens.pop(tenant_id, None)
         _enabled.pop(tenant_id, None)
         _restarts.pop(tenant_id, None)
         _save_registry()
+
+
+def restart(tenant: Tenant) -> dict:
+    """重启指定租户的 bridge（用于代理等环境变量变更后立即生效）。"""
+    with _lock:
+        stop(tenant.user_id, preserve_port=True)
+        return start(tenant)
 
 
 def status(tenant: Optional[Tenant] = None) -> dict:
@@ -246,17 +352,27 @@ def status(tenant: Optional[Tenant] = None) -> dict:
         return {"online": False, "port": None, "reason": "no tenant"}
     port = _ports.get(tenant.user_id)
     proc = _procs.get(tenant.user_id)
+    pid = None
+    running = False
+    if proc is not None and proc.poll() is None:
+        pid = proc.pid
+        running = True
+    else:
+        saved_pid = _pids.get(tenant.user_id)
+        if _pid_is_bridge(saved_pid):
+            pid = saved_pid
+            running = True
     online = bool(port) and _alive(port)
     return {
         "online": online,
         "port": port,
-        "pid": proc.pid if proc and proc.poll() is None else None,
-        "running": bool(proc and proc.poll() is None),
+        "pid": pid,
+        "running": running,
     }
 
 
 def shutdown_all() -> None:
-    for tenant_id in list(_procs):
+    for tenant_id in list(set(_procs) | set(_pids)):
         try:
             stop(tenant_id)
         except Exception:
@@ -327,11 +443,11 @@ def start_watchdog(interval: int = 60) -> None:
 
     def loop():
         while True:
-            time.sleep(interval)
             try:
                 reconcile()
             except Exception:
                 logger.exception("[bridge] 看门狗执行失败")
+            time.sleep(interval)
 
     _watchdog = threading.Thread(target=loop, daemon=True, name="bridge-watchdog")
     _watchdog.start()

@@ -156,9 +156,12 @@ def main(argv=None) -> int:
 
     from config import get_api_key, get_config, load_config, load_dotenv
 
+    # 让子进程（bridge_manager 启动的 Node bridge）拿到真实的监听端口
+    os.environ["API_PORT"] = str(args.port)
     load_dotenv(str(data_dir / ".env"))
     load_config(str(data_dir / "config.yaml"))
     cfg = get_config()
+    cfg.api.port = args.port
     logger.info("Data dir: %s", data_dir)
     logger.info("Model: %s via %s", cfg.ai.model, cfg.ai.base_url)
 

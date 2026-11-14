@@ -12,7 +12,11 @@ const PYTHON_API = process.env.PYTHON_API || 'http://127.0.0.1:8000';
 const DATA_DIR = process.env.WHATSAPP_BOT_DATA_DIR || path.join(__dirname, '..');
 const AUTH_DIR = path.join(DATA_DIR, 'data', '.baileys-auth');
 const TENANT_ID = process.env.WA_TENANT_ID || '';
-const TENANT_HEADERS = TENANT_ID ? { 'X-Tenant-Id': TENANT_ID } : {};
+const BRIDGE_TOKEN = process.env.WA_BRIDGE_TOKEN || '';
+const TENANT_HEADERS = {
+    ...(TENANT_ID ? { 'X-Tenant-Id': TENANT_ID } : {}),
+    ...(BRIDGE_TOKEN ? { 'X-Bridge-Token': BRIDGE_TOKEN } : {}),
+};
 
 const app = express();
 app.use(express.json());
@@ -119,6 +123,44 @@ async function forwardToPython(phone, body, msgId, timestamp) {
     } catch (e) { console.error('[webhook] forward failed:', e.message, e.stack); return { action: 'ignore', reason: 'fetch failed' }; }
 }
 
+function extractMessageText(rawMsg) {
+    let m = rawMsg;
+    for (let i = 0; i < 4 && m; i++) {
+        if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
+        if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
+        if (m.viewOnceMessageV2?.message) { m = m.viewOnceMessageV2.message; continue; }
+        if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
+        break;
+    }
+    if (!m) return '';
+    return (
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        m.documentMessage?.caption ||
+        m.buttonsResponseMessage?.selectedDisplayText ||
+        m.listResponseMessage?.title ||
+        ''
+    );
+}
+
+const jidQueues = new Map();
+
+function enqueueForJid(jid, task) {
+    const prev = jidQueues.get(jid) || Promise.resolve();
+    const next = prev
+        .catch(() => {})
+        .then(task)
+        .finally(() => {
+            if (jidQueues.get(jid) === next) {
+                jidQueues.delete(jid);
+            }
+        });
+    jidQueues.set(jid, next);
+    return next;
+}
+
 async function start() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const opts = { auth: state, printQRInTerminal: false, connectTimeoutMs: 60_000, browser: ['WhatsApp Bot', 'Chrome', '2.0.0'] };
@@ -159,73 +201,24 @@ async function start() {
         }
     });
 
-    sock.ev.on('messages.upsert', async (msg) => {
-        console.log("[DEBUG] upsert fired", msg.messages.length);
+    sock.ev.on('messages.upsert', (msg) => {
+        console.log("[DEBUG] upsert fired", msg.type, msg.messages.length);
         if (isShutdown || !clientReady) return;
+        if (msg.type && msg.type !== 'notify') return;
         for (const m of msg.messages) {
             if (!m.key || m.key.fromMe) continue;
             const jid = m.key.remoteJid;
-            if (jid && !jid.endsWith('@g.us') && !contacts.has(jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, ''))) {
-                const p = jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, '');
+            if (!jid || jid === 'status@broadcast' || jid.endsWith('@g.us') || jid.endsWith('@newsletter')) continue;
+            const p = jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, '');
+            if (!contacts.has(p)) {
                 setContact(p, { phone: p, name: m.pushName || '' });
             }
-            const text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+            const text = extractMessageText(m.message);
             if (!text.trim()) continue;
-            console.log("[DEBUG] forwarding to", PYTHON_API); forwardToPython(m.key.remoteJid || 'unknown', text, m.key.id, m.messageTimestamp);
+            console.log("[DEBUG] forwarding to", PYTHON_API);
+            enqueueForJid(jid, () => forwardToPython(jid, text, m.key.id, m.messageTimestamp));
         }
     });
-}
-
-// ── Follow-up message transformation ──────────────────────
-// Hardcoded template from Python backend uses full name and fixed phrasing.
-// We intercept and rewrite to use first name + varied human-like templates.
-
-function getFirstName(fullName) {
-    if (!fullName) return 'there';
-    const parts = fullName.trim().split(/\s+/);
-    let first = parts[0];
-    // Skip titles: Mr., Mrs., Ms., Miss, Dr., Prof., Eng., Sir, Madam
-    if (/^(Mr|Mrs|Ms|Miss|Dr|Prof|Eng|Sir|Madam)\.?$/i.test(first)) {
-        first = parts.length > 1 ? parts[1] : first;
-    }
-    // Skip single-letter initials
-    if (first.length <= 1 && parts.length > 1) {
-        first = parts[1];
-    }
-    // Capitalize first letter
-    return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
-}
-
-const FOLLOWUP_VARIATIONS = [
-    (firstName) => `Hi ${firstName}, hope you're having a great week! This is Grant from Tide Power. Just wanted to check in — is there anything I can help with regarding your power generation needs?`,
-    (firstName) => `Hi ${firstName}, Grant here from Tide Power. Following up on our earlier conversation — let me know if you have any questions or would like more details on any of our gas generator solutions.`,
-    (firstName) => `Hello ${firstName}, just a quick note from Grant at Tide Power. Wanted to see if you had any updates on your project, or if I can assist with anything at all.`,
-    (firstName) => `Hi ${firstName}, hope all is well! Grant from Tide Power checking in. If you need technical specs, pricing, or just want to discuss options, I'm here to help.`,
-    (firstName) => `Hi ${firstName}, this is Grant with Tide Power. I wanted to follow up and see if the information we shared was helpful — happy to go deeper on any topic or answer any questions.`,
-    (firstName) => `Hello ${firstName}, Grant from Tide Power here. Just touching base to see how things are going with your project — let me know if you need anything at all.`,
-    (firstName) => `Hi ${firstName}, hope your week is going well! This is Grant at Tide Power. Quick check-in — any thoughts on the generator options we discussed? I'm here if you need anything.`,
-];
-
-function transformFollowupMessage(message, phone) {
-    // Match the Python backend's hardcoded followup template:
-    // "Hi <Full Name>, this is <Owner> from <Company>. Just following up on our conversation - is there anything I can help you with?"
-    const pattern = /^Hi\s+(.+?),\s+this is\s+\S+(?:\s+\S+)?\s+from\s+\S.+?\.\s+Just following up on our conversation\s*[-–—]\s*is there anything I can help you with\??\s*$/i;
-    const match = message.match(pattern);
-    if (!match) return message; // Not the hardcoded followup template — pass through
-
-    const fullName = match[1].trim();
-    const firstName = getFirstName(fullName);
-
-    // Hash phone number to pick a consistent variation per customer
-    let hash = 0;
-    for (let i = 0; i < phone.length; i++) {
-        hash = ((hash << 5) - hash) + phone.charCodeAt(i);
-        hash |= 0;
-    }
-    const idx = Math.abs(hash) % FOLLOWUP_VARIATIONS.length;
-    const transformed = FOLLOWUP_VARIATIONS[idx](firstName);
-    console.log('[send] transformed followup:', fullName, '->', firstName, '| variant', idx);
-    return transformed;
 }
 
 app.get('/health', (_, r) => r.json({ status: 'ok' }));
@@ -242,8 +235,6 @@ app.post('/send', async (req, res) => {
     const cleaned = sendResult.cleanPhone(phone);
     if (!cleaned) return res.status(400).json(sendResult.failedResult('清理后电话号码为空', 'invalid_phone'));
     phone = cleaned;
-    // Transform hardcoded followup template → first name + varied human-like message
-    message = transformFollowupMessage(message, phone);
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     console.log('[send] cleaned phone:', phone, '-> jid:', jid);
     const result = await sendText(phone, message, 15000);
@@ -305,27 +296,14 @@ async function loadBaileys() {
     DisconnectReason = m.DisconnectReason;
 }
 
+app.post('/sync-contacts', async (_, r) => {
+    if (!sock || !clientReady) return r.json({ ok: false, error: 'not connected' });
+    const allContacts = Array.from(contacts.values());
+    r.json({ ok: true, count: allContacts.length, contacts: allContacts });
+});
+
 (async () => {
     await loadBaileys();
     console.log(`Bridge listening on ${BRIDGE_HOST}:${BRIDGE_PORT}`);
-    // Force-fetch WhatsApp contacts
-app.post('/sync-contacts', async (_, r) => {
-    if (!sock) return r.json({ok: false, error: 'not connected'});
-    try {
-        // Baileys stores contacts internally after sync
-        const allContacts = [];
-        if (sock.store && sock.store.contacts) {
-            for (const [jid, contact] of Object.entries(sock.store.contacts)) {
-                if (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@c.us')) {
-                    const phone = jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, '');
-                    setContact(phone, { phone, name: contact.name || contact.notify || contact.verifiedName || phone });
-                    allContacts.push({ phone, name: contact.name || contact.notify || contact.verifiedName || phone });
-                }
-            }
-        }
-        r.json({ ok: true, count: allContacts.length, contacts: allContacts });
-    } catch(e) { r.json({ ok: false, error: e.message }); }
-});
-
-app.listen(BRIDGE_PORT, BRIDGE_HOST, start);
+    app.listen(BRIDGE_PORT, BRIDGE_HOST, start);
 })();

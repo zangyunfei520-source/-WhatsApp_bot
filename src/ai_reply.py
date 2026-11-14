@@ -13,18 +13,35 @@ from database import get_last_ai_reply_time, get_recent_conversations
 
 logger = logging.getLogger(__name__)
 
-_client: Optional[OpenAI] = None
-_hourly_reply_count = 0
-_hourly_reset_at = time.time()
+_clients: dict[tuple[str, str, str], OpenAI] = {}
+_client_lock = threading.Lock()
+_hourly_counters: dict[str, list[float]] = {}
 _counter_lock = threading.Lock()
 
+
+def _tenant_key() -> str:
+    try:
+        import tenancy
+        tenant = tenancy.current()
+        if tenant is not None:
+            return tenant.user_id
+    except Exception:
+        pass
+    return "default"
+
+
 def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        from config import get_api_key
-        cfg = get_config()
-        _client = OpenAI(api_key=get_api_key(), base_url=cfg.ai.base_url)
-    return _client
+    from config import get_api_key
+    cfg = get_config()
+    api_key = get_api_key()
+    base_url = cfg.ai.base_url
+    cache_key = (_tenant_key(), api_key, base_url)
+    with _client_lock:
+        client = _clients.get(cache_key)
+        if client is None:
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
+            _clients[cache_key] = client
+        return client
 
 
 # ── Specs loader ─────────────────────────────────────────────────────────────
@@ -57,9 +74,12 @@ def _load_product_specs() -> str:
 # ── Lean system prompt (~1.3K) ───────────────────────────────────────────────
 
 def _build_system_prompt(customer: dict) -> str:
+    cfg = get_config()
+    company_name = cfg.business.company_name or "our company"
+    owner_name = cfg.business.owner_name or "our team"
     notes = customer.get("notes", "")
     memory = f"\nCustomer history: {notes}" if (notes and notes.strip() and notes.strip() != "N/A") else ""
-    return f"""You are a professional sales consultant communicating with customers via WhatsApp. Your company manufactures gas generator sets (7kW-4.5MW), with OEM partnerships including MWM, Lister Petter, CNPC Jichai, and MAN.{memory}
+    return f"""You are a professional sales consultant at {company_name} (representative: {owner_name}), communicating with customers via WhatsApp.{memory}
 
 ## Communication Style
 - Chat like a real salesperson on WhatsApp: conversational, natural, warm. Never sound like a chatbot.
@@ -77,13 +97,11 @@ def _build_system_prompt(customer: dict) -> str:
 - For short/ambiguous messages (like "Hi", "Hello", "OK"), default to ENGLISH.
 
 ## Product & Pricing
-- Only use specs and figures from the product database. If you're not sure, say "Let me check with our technical team" — never make up numbers.
-- Give price ranges only. Never give a formal quote in chat — say "I'll send you a formal quotation."
-- Lead time is typically 12-20 weeks. Specific models can be checked for the customer.
-- Warranty: 12 months or 1,000 hours.
+- Only use product details, lead times, warranty terms, and figures from the product database. If you're not sure, say "Let me check with our technical team" — never make up numbers.
+- Give price ranges only unless confirmed in the database. Never commit to an unverified formal quote in chat — say "I'll send you a formal quotation."
 
 ## Conversation Flow
-- After answering, naturally guide to the next step: ask about power requirements, recommend a model, send a spec sheet, or schedule a call.
+- After answering, naturally guide to the next step: ask about their requirements, recommend an option from the product database, offer documentation, or schedule a call.
 - Don't be pushy, but every message should move the conversation forward.
 
 Customer: {customer.get('name', 'Unknown')} | Company: {customer.get('company', 'N/A')}"""
@@ -148,17 +166,19 @@ def should_auto_reply(message_body: str) -> bool:
 
 def check_rate_limits(customer_id: int) -> tuple[bool, str]:
     cfg = get_config()
-    global _hourly_reply_count, _hourly_reset_at
     last = get_last_ai_reply_time(customer_id)
     if last and (datetime.now() - last) < timedelta(minutes=cfg.ai.reply_cooldown_minutes):
         return False, "cooldown"
+    tkey = _tenant_key()
+    now_ts = time.time()
     with _counter_lock:
-        if time.time() - _hourly_reset_at > 3600:
-            _hourly_reply_count = 0
-            _hourly_reset_at = time.time()
-        if _hourly_reply_count >= cfg.business.max_auto_replies_per_hour:
+        bucket = _hourly_counters.get(tkey)
+        if bucket is None or now_ts - bucket[1] > 3600:
+            bucket = [0, now_ts]
+            _hourly_counters[tkey] = bucket
+        if bucket[0] >= cfg.business.max_auto_replies_per_hour:
             return False, "hourly limit"
-        _hourly_reply_count += 1
+        bucket[0] += 1
     return True, "ok"
 
 
@@ -432,10 +452,11 @@ def generate_followup(customer: dict) -> str:
         else:
             lang_instruction = "Write this message in English."
 
+        company_name = cfg.business.company_name or "our company"
         resp = client.chat.completions.create(
             model=cfg.ai.model, max_tokens=400,
             messages=[
-                {"role": "system", "content": f"""You are a technical sales follow-up assistant for a gas generator manufacturer (7kW-4.5MW, OEM partner of MWM, Lister Petter, CNPC Jichai, MAN).
+                {"role": "system", "content": f"""You are a sales follow-up assistant for {company_name}.
 
 Write a short, warm follow-up message. One or two sentences max, casual not pushy.
 
@@ -443,11 +464,7 @@ Write a short, warm follow-up message. One or two sentences max, casual not push
 
 IMPORTANT: Sign off with the sender's real name which is {cfg.business.owner_name}. NEVER use placeholder text like [Your Name], [Name], or any bracket text — always use the actual name.
 
-When there is local electricity/power industry context, naturally reference it to show you understand their market. For example:
-- If their country has grid reliability issues, mention how gas gensets help with backup power
-- If they're in oil & gas, mention reliable power for remote operations
-- If they're transitioning from coal, mention cleaner natural gas alternatives
-- Don't force it — if the context doesn't fit naturally, just be warmly casual"""},
+When customer notes or market context is relevant, naturally reference it without forcing it."""},
                 {"role": "user", "content": f"""Customer: {customer.get('name','Valued Customer')} from {customer.get('company','N/A')}.
 Notes: {customer.get('notes','N/A')}.{country_hint}
 
@@ -456,9 +473,7 @@ Write a short follow-up message in {language if language else 'English'}, and si
         return _clean_reply(resp.choices[0].message.content)
     except Exception as e:
         logger.error(f"Follow-up failed: {e}")
-        if country_name and power_context:
-            return f"Hi {customer.get('name','there')}, following up — just a quick note on the power situation in {country_name}, our gas generators might be a great fit for your needs. Happy to chat when you have a moment!"
-        return f"Hi {customer.get('name','there')}, just checking in — anything I can help with regarding the gas generators?"
+        return f"Hi {customer.get('name','there')}, just checking in — anything I can help with regarding our products or your requirements?"
 
 
 # ── Strategy-Aware Message Generation ─────────────────────────────────────────

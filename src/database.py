@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from config import get_config
 
+logger = logging.getLogger(__name__)
+
 _write_lock = threading.Lock()
+_conn_lock = threading.RLock()
 # 每个租户一个数据库文件，连接按路径缓存
 _conns: dict[str, sqlite3.Connection] = {}
 
@@ -273,37 +278,56 @@ def _reset_stale_quota_reservations(conn: sqlite3.Connection) -> None:
 
 
 def get_connection() -> sqlite3.Connection:
-    """返回当前租户的连接（按数据库文件路径缓存）。"""
+    """返回当前租户的连接（按数据库文件路径缓存，线程安全）。"""
     cfg = get_config()
     db_path = Path(cfg.database.path).resolve()
     key = str(db_path)
-    conn = _conns.get(key)
-    if conn is None:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.executescript(SCHEMA)
-        _apply_migrations(conn)
-        _reset_stale_quota_reservations(conn)
-        # Legacy one-off migrations retained for older databases.
-        try: conn.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'USD'")
-        except: pass
-        try: conn.execute("ALTER TABLE customers ADD COLUMN email TEXT DEFAULT ''")
-        except: pass
-        conn.commit()
-        _conns[key] = conn
-    return conn
+    with _conn_lock:
+        conn = _conns.get(key)
+        if conn is None:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000;")
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.executescript(SCHEMA)
+            _apply_migrations(conn)
+            _reset_stale_quota_reservations(conn)
+            # Legacy one-off migrations retained for older databases.
+            try: conn.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'USD'")
+            except sqlite3.Error: pass
+            try: conn.execute("ALTER TABLE customers ADD COLUMN email TEXT DEFAULT ''")
+            except sqlite3.Error: pass
+            conn.commit()
+            _conns[key] = conn
+        return conn
+
+
+@contextmanager
+def db_write():
+    """Serialize multi-statement SQLite writes under the shared write lock."""
+    conn = get_connection()
+    with _write_lock:
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
 
 
 def close_db():
-    for conn in list(_conns.values()):
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-    _conns.clear()
+    with _conn_lock:
+        for conn in list(_conns.values()):
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        _conns.clear()
 
 
 def get_or_create_customer(phone: str, name: Optional[str] = None) -> dict:
@@ -957,4 +981,261 @@ def find_best_matching_document(customer_message: str) -> Optional[dict]:
     if best_match and best_score >= 5:
         return dict(best_match)
     return None
+
+
+def _delete_customer_rows(conn: sqlite3.Connection, customer_id: int) -> None:
+    """Delete a customer and every referencing child row (requires write lock)."""
+    conn.execute("DELETE FROM sent_followups WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM follow_up_schedule WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM ai_memory_entries WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM agent_decisions WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM lead_scores WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM orders WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM conversations WHERE customer_id=?", (customer_id,))
+    conn.execute("DELETE FROM customers WHERE id=?", (customer_id,))
+
+
+def delete_customer_cascade(customer_id: int) -> Optional[dict]:
+    """Delete a customer and all related records atomically."""
+    with db_write() as conn:
+        row = conn.execute(
+            "SELECT id, name, phone FROM customers WHERE id=?",
+            (customer_id,),
+        ).fetchone()
+        if not row:
+            return None
+        _delete_customer_rows(conn, customer_id)
+        return {"id": row["id"], "name": row["name"], "phone": row["phone"]}
+
+
+def merge_customers(target_customer_id: int, source_customer_id: int) -> Optional[dict]:
+    """Reassign all child records from source_customer_id to target_customer_id and delete source."""
+    if target_customer_id == source_customer_id:
+        return None
+    with db_write() as conn:
+        source = conn.execute(
+            "SELECT id, name, phone FROM customers WHERE id=?",
+            (source_customer_id,),
+        ).fetchone()
+        if not source:
+            return None
+        conn.execute("UPDATE conversations SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+        has_active_sched = conn.execute(
+            "SELECT id FROM follow_up_schedule WHERE customer_id=? AND active=1 LIMIT 1",
+            (target_customer_id,),
+        ).fetchone()
+        if has_active_sched:
+            conn.execute("UPDATE follow_up_schedule SET active=0 WHERE customer_id=?",
+                         (source_customer_id,))
+        conn.execute("UPDATE follow_up_schedule SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+        conn.execute("UPDATE sent_followups SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+        conn.execute("UPDATE orders SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+        conn.execute("UPDATE agent_decisions SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+        conn.execute("UPDATE ai_memory_entries SET customer_id=? WHERE customer_id=?",
+                     (target_customer_id, source_customer_id))
+
+        target_score = conn.execute(
+            "SELECT id FROM lead_scores WHERE customer_id=?", (target_customer_id,)
+        ).fetchone()
+        if target_score:
+            conn.execute("DELETE FROM lead_scores WHERE customer_id=?", (source_customer_id,))
+        else:
+            conn.execute("UPDATE lead_scores SET customer_id=? WHERE customer_id=?",
+                         (target_customer_id, source_customer_id))
+
+        conn.execute("DELETE FROM customers WHERE id=?", (source_customer_id,))
+        return {"id": source["id"], "name": source["name"], "phone": source["phone"]}
+
+
+def cleanup_invalid_phone_customers(action: str) -> dict:
+    """Detect or clean up customers with non-phone alphabetical values under write lock."""
+    conn = get_connection()
+    invalid = conn.execute(
+        """SELECT c.id, c.phone, c.name, c.status,
+                  (SELECT COUNT(*) FROM conversations WHERE customer_id=c.id) as conv_count,
+                  (SELECT COUNT(*) FROM orders WHERE customer_id=c.id) as order_count
+           FROM customers c
+           WHERE c.phone GLOB '*[A-Za-z]*' AND c.phone NOT GLOB '+*'"""
+    ).fetchall()
+
+    result = {"action": action, "total_invalid": len(invalid)}
+    if action == "detect_only":
+        result["message"] = f"发现 {len(invalid)} 个无效号码。使用 action=delete_safe 或 action=mark_inactive 执行清理。"
+        return result
+
+    if action == "delete_safe":
+        to_delete = [r for r in invalid if r["conv_count"] == 0 and r["order_count"] == 0]
+        deleted_ids = []
+        with db_write() as wconn:
+            for r in to_delete:
+                _delete_customer_rows(wconn, r["id"])
+                deleted_ids.append({"id": r["id"], "phone": r["phone"], "name": r["name"]})
+        result["deleted_count"] = len(deleted_ids)
+        result["deleted"] = deleted_ids
+        result["skipped_count"] = len(invalid) - len(deleted_ids)
+        result["message"] = f"已删除 {len(deleted_ids)} 个无效号码客户（无对话与订单记录），跳过 {result['skipped_count']} 个（需手动处理）"
+        return result
+
+    if action == "mark_inactive":
+        now = datetime.now().isoformat()
+        with db_write() as wconn:
+            for r in invalid:
+                wconn.execute(
+                    "UPDATE customers SET status='inactive', "
+                    "notes=COALESCE(notes,'') || ' [自动标记：电话号码无效]', updated_at=? WHERE id=?",
+                    (now, r["id"]),
+                )
+                wconn.execute("UPDATE follow_up_schedule SET active=0 WHERE customer_id=?", (r["id"],))
+        result["marked_inactive"] = len(invalid)
+        result["message"] = f"已将 {len(invalid)} 个无效号码客户标记为 inactive，其跟进计划已全部暂停。"
+        return result
+
+    result["error"] = f"未知操作: {action}，支持 detect_only / delete_safe / mark_inactive"
+    return result
+
+
+def ensure_active_batch_schedule(customer_id: int, frequency_days: int = 7) -> dict:
+    """Ensure a single active follow-up schedule exists and is immediately due for batch push."""
+    now_iso = datetime.now().isoformat()
+    with db_write() as conn:
+        cust = conn.execute(
+            "SELECT id, name, phone, status FROM customers WHERE id=?",
+            (customer_id,),
+        ).fetchone()
+        if not cust:
+            return {"error": "customer not found"}
+        if cust["status"] not in ("active", "inactive"):
+            return {"error": f"customer status is {cust['status']}"}
+        if cust["status"] == "inactive":
+            conn.execute(
+                "UPDATE customers SET status='active', updated_at=? WHERE id=?",
+                (now_iso, customer_id),
+            )
+
+        active_row = conn.execute(
+            "SELECT id FROM follow_up_schedule WHERE customer_id=? AND active=1 ORDER BY id LIMIT 1",
+            (customer_id,),
+        ).fetchone()
+        if active_row:
+            conn.execute(
+                "UPDATE follow_up_schedule SET next_followup_at=COALESCE(next_followup_at, ?) "
+                "WHERE id=?",
+                (now_iso, active_row["id"]),
+            )
+        else:
+            inactive_row = conn.execute(
+                "SELECT id FROM follow_up_schedule WHERE customer_id=? ORDER BY id DESC LIMIT 1",
+                (customer_id,),
+            ).fetchone()
+            if inactive_row:
+                conn.execute(
+                    "UPDATE follow_up_schedule SET active=1, next_followup_at=? WHERE id=?",
+                    (now_iso, inactive_row["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO follow_up_schedule(customer_id, frequency_days, next_followup_at, active) "
+                    "VALUES(?, ?, ?, 1)",
+                    (customer_id, frequency_days, now_iso),
+                )
+
+        sched = conn.execute(
+            "SELECT fs.*, c.name, c.phone, c.company FROM follow_up_schedule fs "
+            "JOIN customers c ON fs.customer_id=c.id WHERE fs.customer_id=? AND fs.active=1 "
+            "ORDER BY fs.id LIMIT 1",
+            (customer_id,),
+        ).fetchone()
+        return {"ok": True, "schedule": dict(sched) if sched else None}
+
+
+def create_order_record(customer_id: int, data: dict) -> dict:
+    """Atomically generate order_no and insert an order under BEGIN IMMEDIATE."""
+    today = datetime.now().strftime("%Y%m%d")
+    order_date = data.get("order_date", today)
+    delivery_date = data.get("delivery_date", "")
+    if order_date and delivery_date and order_date > delivery_date:
+        return {"error": "下单日期不能晚于交付日期"}
+
+    prefix = f"TP{today}"
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    with _write_lock:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            customer = conn.execute("SELECT id FROM customers WHERE id=?", (customer_id,)).fetchone()
+            if not customer:
+                conn.rollback()
+                return {"error": "customer not found"}
+
+            rows = conn.execute(
+                "SELECT order_no FROM orders WHERE order_no LIKE ?",
+                (f"{prefix}%",),
+            ).fetchall()
+            max_seq = 0
+            for r in rows:
+                suffix = r["order_no"][len(prefix):]
+                if suffix.isdigit():
+                    max_seq = max(max_seq, int(suffix))
+            order_no = f"{prefix}{max_seq + 1:03d}"
+
+            conn.execute(
+                """INSERT INTO orders(order_no, customer_id, product, quantity, unit_price, total_amount,
+                   status, order_date, delivery_date, notes, currency, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (order_no, customer_id, data.get("product", ""), data.get("quantity", 1),
+                 data.get("unit_price"), data.get("total_amount"),
+                 data.get("status", "pending"), order_date,
+                 delivery_date, data.get("notes", ""), data.get("currency", "USD"), now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT o.*, c.name as customer_name FROM orders o "
+                "JOIN customers c ON o.customer_id=c.id WHERE o.order_no=?",
+                (order_no,),
+            ).fetchone()
+            return {"ok": True, "order": dict(row)}
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def update_order_record(order_id: int, data: dict) -> dict:
+    allowed = {"order_no", "customer_id", "product", "quantity", "unit_price", "total_amount",
+               "status", "order_date", "delivery_date", "notes", "currency"}
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return {"error": "no valid fields"}
+
+    with db_write() as conn:
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            return {"error": "not found"}
+        new_order_date = updates["order_date"] if "order_date" in updates else row["order_date"]
+        new_delivery_date = updates["delivery_date"] if "delivery_date" in updates else row["delivery_date"]
+        if new_order_date and new_delivery_date and new_order_date > new_delivery_date:
+            return {"error": "下单日期不能晚于交付日期"}
+        updates["updated_at"] = datetime.now().isoformat()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(
+            f"UPDATE orders SET {set_clause} WHERE id=?",
+            list(updates.values()) + [order_id],
+        )
+        updated = conn.execute(
+            "SELECT o.*, c.name as customer_name FROM orders o "
+            "JOIN customers c ON o.customer_id=c.id WHERE o.id=?",
+            (order_id,),
+        ).fetchone()
+        return {"ok": True, "order": dict(updated)}
+
+
+def delete_order_record(order_id: int) -> bool:
+    with db_write() as conn:
+        cur = conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
+        return cur.rowcount > 0
+
 

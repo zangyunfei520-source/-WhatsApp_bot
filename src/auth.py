@@ -7,6 +7,7 @@ contextvar，后续所有 ``get_config()`` / ``get_connection()`` 都会落到�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -47,10 +48,24 @@ _locked_until: Dict[Tuple[str, str], float] = {}
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    peer = request.client.host if request.client else ""
+    trust_proxy = os.getenv("WA_TRUST_PROXY", "") in ("1", "true", "yes")
+    if trust_proxy or peer in ("127.0.0.1", "::1", "localhost"):
+        fwd = request.headers.get("x-forwarded-for", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return peer
+
+
+def _prune_rate_limits(now: float) -> None:
+    if len(_fails) > 1000:
+        expired = [k for k, dq in _fails.items() if not dq or now - dq[-1] > _WINDOW]
+        for k in expired:
+            _fails.pop(k, None)
+    if len(_locked_until) > 1000:
+        expired = [k for k, until in _locked_until.items() if until <= now]
+        for k in expired:
+            _locked_until.pop(k, None)
 
 
 def _check_rate_limit(key: Tuple[str, str]) -> Optional[int]:
@@ -58,11 +73,14 @@ def _check_rate_limit(key: Tuple[str, str]) -> Optional[int]:
     until = _locked_until.get(key)
     if until and until > now:
         return int(until - now)
+    if until is not None:
+        _locked_until.pop(key, None)
     return None
 
 
 def _record_failure(key: Tuple[str, str]) -> None:
     now = time.time()
+    _prune_rate_limits(now)
     bucket = _fails.setdefault(key, deque())
     bucket.append(now)
     while bucket and now - bucket[0] > _WINDOW:
@@ -99,12 +117,28 @@ def _set_session_cookie(response: Response, token: str, request: Request) -> Non
 
 
 def _origin_ok(request: Request) -> bool:
-    """防 CSRF：带 Origin 的写请求必须同源。"""
+    """防 CSRF：带 Origin 的写请求必须同源（兼容反向代理与 WA_PUBLIC_ORIGIN）。"""
     origin = request.headers.get("origin")
     if not origin:
         return True
-    host = request.headers.get("host", "")
-    return origin.split("://")[-1].split("/")[0] == host
+    origin_clean = origin.strip().rstrip("/")
+    origin_host = origin_clean.split("://")[-1].split("/")[0].lower()
+    allowed_hosts = set()
+    host = (request.headers.get("host") or "").strip().lower()
+    if host:
+        allowed_hosts.add(host)
+    peer = request.client.host if request.client else ""
+    trust_proxy = os.getenv("WA_TRUST_PROXY", "") in ("1", "true", "yes")
+    if trust_proxy or peer in ("127.0.0.1", "::1", "localhost"):
+        fwd_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip().lower()
+        if fwd_host:
+            allowed_hosts.add(fwd_host)
+    public_origin = (os.getenv("WA_PUBLIC_ORIGIN") or os.getenv("WA_PUBLIC_HOST") or "").strip()
+    for item in public_origin.split(","):
+        item = item.strip().rstrip("/")
+        if item:
+            allowed_hosts.add(item.split("://")[-1].split("/")[0].lower())
+    return origin_host in allowed_hosts
 
 
 def _login_html() -> str:
@@ -118,7 +152,7 @@ def _login_html() -> str:
 async def login_page(request: Request):
     # 已经过了 Cloudflare Access 的人不该再看到登录页
     if cf_access.enabled() and request.cookies.get(cf_access.COOKIE_NAME):
-        result = _cf_login(request)
+        result = await _cf_login(request)
         if result:
             _, token = result
             resp = RedirectResponse("/", status_code=302)
@@ -154,13 +188,15 @@ async def bootstrap(request: Request):
     email = (body.get("email") or "").strip()
     password = body.get("password") or ""
     try:
-        user = accounts.create_user(
+        user = await asyncio.to_thread(
+            accounts.create_user,
             email, password, tenancy.base_data_dir(), is_owner=True)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    token = accounts.create_session(user["id"], _client_ip(request),
-                                    request.headers.get("user-agent", ""))
+    token = await asyncio.to_thread(
+        accounts.create_session, user["id"], _client_ip(request),
+        request.headers.get("user-agent", ""))
     logger.info("[auth] 初始化管理员账号 %s -> %s", user["email"], user["data_dir"])
     resp = JSONResponse({"ok": True, "email": user["email"]})
     _set_session_cookie(resp, token, request)
@@ -193,12 +229,14 @@ async def register(request: Request):
     data_dir = tenancy.ensure_tenant_dir(user_id, template=template)
 
     try:
-        user = accounts.create_user(email, password, data_dir, user_id=user_id)
+        user = await asyncio.to_thread(
+            accounts.create_user, email, password, data_dir, user_id=user_id)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    token = accounts.create_session(user["id"], _client_ip(request),
-                                    request.headers.get("user-agent", ""))
+    token = await asyncio.to_thread(
+        accounts.create_session, user["id"], _client_ip(request),
+        request.headers.get("user-agent", ""))
     logger.info("[auth] 新用户注册 %s -> %s", user["email"], user["data_dir"])
     resp = JSONResponse({"ok": True, "email": user["email"]})
     _set_session_cookie(resp, token, request)
@@ -220,14 +258,15 @@ async def login(request: Request):
             {"error": f"尝试次数过多，请 {wait // 60 + 1} 分钟后再试"},
             status_code=429)
 
-    user = accounts.authenticate(email, password)
+    user = await asyncio.to_thread(accounts.authenticate, email, password)
     if not user:
         _record_failure(key)
         return JSONResponse({"error": "邮箱或密码不正确"}, status_code=401)
 
     _clear_failures(key)
-    token = accounts.create_session(user["id"], _client_ip(request),
-                                    request.headers.get("user-agent", ""))
+    token = await asyncio.to_thread(
+        accounts.create_session, user["id"], _client_ip(request),
+        request.headers.get("user-agent", ""))
     logger.info("[auth] 登录成功 %s", user["email"])
     resp = JSONResponse({"ok": True, "email": user["email"]})
     _set_session_cookie(resp, token, request)
@@ -236,6 +275,8 @@ async def login(request: Request):
 
 @router.post("/api/auth/logout")
 async def logout(request: Request):
+    if not _origin_ok(request):
+        return JSONResponse({"error": "bad origin"}, status_code=403)
     token = request.cookies.get(accounts.SESSION_COOKIE)
     if token:
         accounts.revoke_session(token)
@@ -279,29 +320,30 @@ def _provision_from_email(email: str) -> dict:
     return user
 
 
-def _cf_login(request: Request):
+async def _cf_login(request: Request):
     """尝试用 Cloudflare Access 的身份直接登录；成功返回 (session, new_token)。"""
     if not cf_access.enabled():
         return None
     cf_token = request.cookies.get(cf_access.COOKIE_NAME)
-    email = cf_access.identity_email(cf_token) if cf_token else None
+    email = await asyncio.to_thread(cf_access.identity_email, cf_token) if cf_token else None
     if not email:
         return None
 
-    user = accounts.get_user_by_email(email)
+    user = await asyncio.to_thread(accounts.get_user_by_email, email)
     if user is None:
         try:
-            user = _provision_from_email(email)
+            user = await asyncio.to_thread(_provision_from_email, email)
         except ValueError:
-            user = accounts.get_user_by_email(email)
+            user = await asyncio.to_thread(accounts.get_user_by_email, email)
         except Exception:
             logger.exception("[auth] SSO 自动开通失败 %s", email)
             return None
     if not user or user.get("status") != "active":
         return None
 
-    token = accounts.create_session(user["id"], _client_ip(request),
-                                    request.headers.get("user-agent", ""))
+    token = await asyncio.to_thread(
+        accounts.create_session, user["id"], _client_ip(request),
+        request.headers.get("user-agent", ""))
     logger.info("[auth] SSO 登录 %s", email)
     return ({"user_id": user["id"], "email": user["email"],
              "data_dir": user["data_dir"]}, token)
@@ -323,7 +365,7 @@ async def middleware(request: Request, call_next):
     new_token = None
     if not session:
         # 走 Cloudflare Access 的单点登录：过一次验证就直接进
-        cf_result = _cf_login(request)
+        cf_result = await _cf_login(request)
         if cf_result:
             session, new_token = cf_result
 
