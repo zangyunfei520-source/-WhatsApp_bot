@@ -10,6 +10,8 @@ business:
   max_auto_replies_per_hour: 30
   max_auto_replies_per_day: 40
   min_delay_between_messages_seconds: 60
+  # 你在手机上亲自回复某客户后，AI 对该客户暂停的分钟数（0 = 不暂停）
+  human_takeover_minutes: 120
 
 ai:
   provider: openai_compatible
@@ -31,5 +33,5 @@ bridge:
   host: "127.0.0.1"
 
 api:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8000

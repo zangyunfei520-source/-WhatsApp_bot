@@ -1,13 +1,14 @@
 # WhatsApp Bot — 网页版
 
-这是从原 Electron 桌面版精简出的**网页端**版本，保留 Python 后端、Web 管理台、WhatsApp Bridge、跟进调度和发送可靠性机制；已移除 Electron 桌面壳、PyInstaller 打包和安装包构建。
-
-原桌面版仍保留在 `~/Desktop/ai应用工程师项目/WhatsApp_bot-main`，可随时回滚。
+面向外贸销售的 WhatsApp AI 助手：自动回复客户询盘、按计划主动跟进、管理客户/订单/产品资料，支持多账号（多租户）。由 Python 后端（FastAPI）、Web 管理台和 Node WhatsApp Bridge（Baileys）组成。
 
 ## 快速开始
 
+需要 Python 3.10+、Node 20+。
+
 ```bash
-cd ~/Desktop/ai应用工程师项目/WhatsApp_bot-web
+git clone https://github.com/Grant-dex/WhatsApp_bot.git
+cd WhatsApp_bot
 
 # 首次安装网页版依赖
 ./run_web.sh --setup
@@ -33,7 +34,6 @@ docker compose up -d --build     # 只监听 127.0.0.1:8000
 网页控制台本身不依赖 Electron。需要收发 WhatsApp 时：
 
 ```bash
-cd ~/Desktop/ai应用工程师项目/WhatsApp_bot-web
 npm --prefix bridge install   # 首次一次
 ./run_web.sh --with-bridge
 ```
@@ -68,6 +68,13 @@ node --check bridge/index.js
 node --test bridge/test/*.test.js tests/js/*.test.js
 ```
 
+## 自动回复的行为
+
+- **人工接管**：你在手机（或其他已登录设备）上亲自回复某个客户后，这条消息会记入对话，AI 对该客户自动暂停 `business.human_takeover_minutes` 分钟（默认 120，设为 0 关闭），期间不自动回复、不主动跟进。对话页可以手动「人工接管 2 小时」或「恢复 AI」。
+- **连发合并**：客户在几秒内连发多条消息时，Bridge 会等客户停下（默认 6 秒，最长 20 秒）再让 AI 一次性回复全部内容。可用环境变量 `MESSAGE_BATCH_MS` / `MESSAGE_BATCH_MAX_MS` 调整，`MESSAGE_BATCH_MS=0` 关闭。
+- **图片 / 语音 / 文件**：会以「[图片]」「[语音]」等占位记入对话并标记「需人工查看」，AI 不会对看不到的内容自动回复。
+- 回复前会显示「正在输入…」。Bridge 默认不打印消息内容，排查问题时可设 `BRIDGE_DEBUG=1`。
+
 ## 网页版结构
 
 - `src/web_main.py`：网页版启动入口
@@ -82,7 +89,6 @@ node --test bridge/test/*.test.js tests/js/*.test.js
 
 - 默认只监听 `127.0.0.1`；不要在没有认证/防火墙保护时使用 `--host 0.0.0.0`。
 - 不连接真实 WhatsApp、不执行真实发送前，建议加 `--no-scheduler` 并使用测试数据库。
-- 原桌面项目未改动：`~/Desktop/ai应用工程师项目/WhatsApp_bot-main`。
 - 停止网页版：运行 `run_web.sh` 的终端按 `Ctrl+C`。
 
 

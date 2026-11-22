@@ -141,13 +141,18 @@ def verify_bridge_token(tenant_id: str, presented: Optional[str]) -> bool:
 
     If WA_WEBHOOK_SECRET is configured, or bridge_manager issued a token for this
     tenant, require an exact constant-time match.
+
+    Fail closed: a named tenant without an issued token (its bridge was never
+    started by this server) is rejected, otherwise any logged-in user could
+    forge inbound messages / QR state / receipts for another tenant. Only the
+    legacy single-user mode (no tenant id) stays open when nothing is configured.
     """
     global_secret = (os.getenv("WA_WEBHOOK_SECRET") or "").strip()
     if global_secret:
         return hmac.compare_digest(global_secret, presented or "")
     expected = _tokens.get(tenant_id)
     if not expected:
-        return True
+        return tenant_id == ""
     return hmac.compare_digest(expected, presented or "")
 
 

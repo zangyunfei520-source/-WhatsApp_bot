@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const sendResult = require('./lib/send-result');
+const inbound = require('./lib/inbound');
 
 let makeWASocket, useMultiFileAuthState, DisconnectReason;
 
@@ -14,6 +15,12 @@ const DATA_DIR = process.env.WHATSAPP_BOT_DATA_DIR || path.join(__dirname, '..')
 const AUTH_DIR = path.join(DATA_DIR, 'data', '.baileys-auth');
 const TENANT_ID = process.env.WA_TENANT_ID || '';
 const BRIDGE_TOKEN = process.env.WA_BRIDGE_TOKEN || '';
+// Quick consecutive messages from one customer are merged into one AI reply.
+const MESSAGE_BATCH_MS = Math.max(0, parseInt(process.env.MESSAGE_BATCH_MS || '6000', 10) || 0);
+const MESSAGE_BATCH_MAX_MS = Math.max(MESSAGE_BATCH_MS, parseInt(process.env.MESSAGE_BATCH_MAX_MS || '20000', 10) || 0);
+// Messages you send from the phone older than this (e.g. history sync after reconnect) are ignored.
+const OWN_MESSAGE_MAX_AGE_S = 10 * 60;
+const DEBUG = process.env.BRIDGE_DEBUG === '1';
 const TENANT_HEADERS = {
     ...(TENANT_ID ? { 'X-Tenant-Id': TENANT_ID } : {}),
     ...(BRIDGE_TOKEN ? { 'X-Bridge-Token': BRIDGE_TOKEN } : {}),
@@ -49,6 +56,7 @@ app.use((req, res, next) => {
 });
 
 let sock = null, clientReady = false, isShutdown = false;
+const ownSentIds = inbound.createSentIdTracker();
 const contacts = new Map();
 const MAX_CONTACTS = 10000;
 
@@ -104,9 +112,13 @@ async function sendText(phone, message, timeoutMs = 15000) {
         return sendResult.failedResult('清理后电话号码为空', 'invalid_phone');
     }
     const jid = cleaned.includes('@') ? cleaned : `${cleaned}@s.whatsapp.net`;
+    // Pre-generate the id and remember it *before* sending: Baileys echoes our
+    // own sends through messages.upsert, and those must not count as a human reply.
+    const messageId = inbound.generateMessageId(crypto.randomBytes);
+    ownSentIds.add(messageId);
     try {
         const sent = await Promise.race([
-            sock.sendMessage(jid, { text: message }),
+            sock.sendMessage(jid, { text: message }, { messageId }),
             sendResult.timeoutPromise(timeoutMs),
         ]);
         return sendResult.sentResult(sent, jid);
@@ -122,15 +134,28 @@ async function sendText(phone, message, timeoutMs = 15000) {
     }
 }
 
-async function forwardToPython(phone, body, msgId, timestamp) {
+async function showTyping(jid, seconds) {
+    if (!sock || !clientReady || !(seconds > 0)) return;
+    try {
+        await sock.presenceSubscribe(jid);
+        await sock.sendPresenceUpdate('composing', jid);
+        await new Promise(resolve => setTimeout(resolve, Math.min(seconds, 8) * 1000));
+        await sock.sendPresenceUpdate('paused', jid);
+    } catch (_) { /* typing indicator is cosmetic */ }
+}
+
+async function forwardToPython(jid, payload) {
+    const phone = payload.from;
     try {
         const r = await fetch(`${PYTHON_API}/webhook/message`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...TENANT_HEADERS },
-            body: JSON.stringify({ from: phone, body, msg_id: msgId || null, timestamp: timestamp ? String(timestamp) : null })
+            body: JSON.stringify(payload)
         });
-        const result = await r.json(); console.log("[webhook] response:", JSON.stringify(result));
+        const result = await r.json();
+        console.log(`[webhook] action=${result.action} reason=${result.reason || ''} conversation=${result.conversation_id || ''}`);
         if (result.action === 'reply' && result.message) {
+            await showTyping(jid, Number(result.delay_seconds) || 0);
             const delivery = await sendText(phone, result.message, 15000);
             const receipt = {
                 conversation_id: result.conversation_id || null,
@@ -150,29 +175,14 @@ async function forwardToPython(phone, body, msgId, timestamp) {
     } catch (e) { console.error('[webhook] forward failed:', e.message, e.stack); return { action: 'ignore', reason: 'fetch failed' }; }
 }
 
-function extractMessageText(rawMsg) {
-    let m = rawMsg;
-    for (let i = 0; i < 4 && m; i++) {
-        if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
-        if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
-        if (m.viewOnceMessageV2?.message) { m = m.viewOnceMessageV2.message; continue; }
-        if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
-        break;
-    }
-    if (!m) return '';
-    return (
-        m.conversation ||
-        m.extendedTextMessage?.text ||
-        m.imageMessage?.caption ||
-        m.videoMessage?.caption ||
-        m.documentMessage?.caption ||
-        m.buttonsResponseMessage?.selectedDisplayText ||
-        m.listResponseMessage?.title ||
-        ''
-    );
-}
-
 const jidQueues = new Map();
+
+const batcher = inbound.createBatcher((jid, items) => {
+    const phone = jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, '');
+    for (const payload of inbound.batchPayloads(phone, items)) {
+        enqueueForJid(jid, () => forwardToPython(jid, payload));
+    }
+}, { quietMs: MESSAGE_BATCH_MS, maxWaitMs: MESSAGE_BATCH_MAX_MS });
 
 function enqueueForJid(jid, task) {
     const prev = jidQueues.get(jid) || Promise.resolve();
@@ -231,21 +241,36 @@ async function start() {
     });
 
     sock.ev.on('messages.upsert', (msg) => {
-        console.log("[DEBUG] upsert fired", msg.type, msg.messages.length);
+        if (DEBUG) console.log('[debug] upsert', msg.type, msg.messages.length);
         if (isShutdown || !clientReady) return;
-        if (msg.type && msg.type !== 'notify') return;
         for (const m of msg.messages) {
-            if (!m.key || m.key.fromMe) continue;
+            if (!m.key) continue;
             const jid = m.key.remoteJid;
             if (!jid || jid === 'status@broadcast' || jid.endsWith('@g.us') || jid.endsWith('@newsletter')) continue;
             const p = jid.replace(/@s\.whatsapp\.net$/, '').replace(/@c\.us$/, '');
+            const info = inbound.classifyMessage(m.message);
+            if (!info) continue;
+
+            if (m.key.fromMe) {
+                // Our own sends echo back here; only messages typed by a human on
+                // the phone / another linked device are reported.
+                if (ownSentIds.has(m.key.id)) continue;
+                const rawTs = m.messageTimestamp;
+                const ts = (rawTs && typeof rawTs.toNumber === 'function' ? rawTs.toNumber() : Number(rawTs)) || 0;
+                if (ts && Date.now() / 1000 - ts > OWN_MESSAGE_MAX_AGE_S) continue;
+                if (msg.type && msg.type !== 'notify' && msg.type !== 'append') continue;
+                enqueueForJid(jid, () => notifyPython('/webhook/outgoing', {
+                    to: p, body: info.text, msg_id: m.key.id || null,
+                    timestamp: ts ? String(ts) : null, message_type: info.type,
+                }, { retries: 2 }));
+                continue;
+            }
+
+            if (msg.type && msg.type !== 'notify') continue;
             if (!contacts.has(p)) {
                 setContact(p, { phone: p, name: m.pushName || '' });
             }
-            const text = extractMessageText(m.message);
-            if (!text.trim()) continue;
-            console.log("[DEBUG] forwarding to", PYTHON_API);
-            enqueueForJid(jid, () => forwardToPython(jid, text, m.key.id, m.messageTimestamp));
+            batcher.push(jid, { text: info.text, type: info.type, msgId: m.key.id, timestamp: m.messageTimestamp });
         }
     });
 }
@@ -265,7 +290,7 @@ app.post('/send', async (req, res) => {
     if (!cleaned) return res.status(400).json(sendResult.failedResult('清理后电话号码为空', 'invalid_phone'));
     phone = cleaned;
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
-    console.log('[send] cleaned phone:', phone, '-> jid:', jid);
+    if (DEBUG) console.log('[send] cleaned phone:', phone, '-> jid:', jid);
     const result = await sendText(phone, message, 15000);
     // Always return 200 with a structured status so the Python backend can
     // distinguish sent / failed / unknown. Status codes are reserved for
@@ -296,12 +321,14 @@ app.post('/send-document', async (req, res) => {
     }
     console.log('[send-document] sending', filename, `(${(fileBuffer.length/1024).toFixed(1)}KB)`, 'to', jid);
     try {
+        const messageId = inbound.generateMessageId(crypto.randomBytes);
+        ownSentIds.add(messageId);
         await Promise.race([
             sock.sendMessage(jid, {
                 document: fileBuffer,
                 mimetype: mime_type || 'application/pdf',
                 fileName: filename
-            }),
+            }, { messageId }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('send timeout')), 60000))
         ]);
         console.log('[send-document] done:', filename);
@@ -316,7 +343,17 @@ app.post('/send-document', async (req, res) => {
     }
 });
 
-['SIGINT', 'SIGTERM'].forEach(s => process.on(s, () => { isShutdown = true; resetBackoff(); if (sock) sock.end(undefined); process.exit(0); }));
+['SIGINT', 'SIGTERM'].forEach(s => process.on(s, () => {
+    isShutdown = true; resetBackoff();
+    // Messages still waiting in the batch window are already persisted nowhere:
+    // hand them to Python (stored, replies may be skipped) before exiting.
+    const pendingQueues = Array.from(jidQueues.values());
+    try { batcher.flushAll(); } catch (_) {}
+    Promise.race([
+        Promise.allSettled([...pendingQueues, ...Array.from(jidQueues.values())]),
+        new Promise(resolve => setTimeout(resolve, 3000)),
+    ]).finally(() => { if (sock) sock.end(undefined); process.exit(0); });
+}));
 
 async function loadBaileys() {
     const m = await import('@whiskeysockets/baileys');

@@ -135,7 +135,7 @@ function renderConversationList() {
   target.innerHTML = list.map(c => `<button class="chat-item ${selectedCustomerId === c.id ? 'active' : ''}" data-cid="${Number(c.id)}" onclick="selectCustomer(${Number(c.id)})" aria-label="打开 ${escapeHtml(c.name || formatPhone(c.phone))} 的对话" aria-current="${selectedCustomerId === c.id ? 'true' : 'false'}">
     ${avatarHtml(c.name, c.phone)}<span class="chat-item-main"><span class="chat-item-top"><span class="chat-name">${escapeHtml(c.name || formatPhone(c.phone))}</span><span class="chat-time">${timeAgo(c.last_msg)}</span></span>
     <span class="chat-item-bottom"><span class="chat-preview">${readReplyDraft(c) ? '<em>草稿 · </em>' : c.last_direction === 'outbound' ? '你：' : ''}${escapeHtml(readReplyDraft(c) || c.last_content || '暂无消息内容')}</span>${c.needs_reply ? '<span class="needs-reply-dot" title="待回复"></span>' : ''}</span>
-    <span class="chat-item-meta">${escapeHtml(c.company || formatPhone(c.phone))}${c.needs_reply ? '<span>待回复</span>' : ''}</span></span></button>`).join('') || `<div class="workspace-empty">${uiIcon(conversationFilter === 'reply' ? 'check' : 'search')}<strong>${q ? '没有找到匹配的客户' : '当前没有待回复客户'}</strong><p>${q ? '试试客户姓名、公司或消息关键词。' : '可切换到全部对话继续查看。'}</p></div>`;
+    <span class="chat-item-meta">${escapeHtml(c.company || formatPhone(c.phone))}${aiPausedUntil(c) ? '<span class="takeover-tag" title="人工接管中，AI 暂停">人工接管</span>' : c.needs_reply ? '<span>待回复</span>' : ''}</span></span></button>`).join('') || `<div class="workspace-empty">${uiIcon(conversationFilter === 'reply' ? 'check' : 'search')}<strong>${q ? '没有找到匹配的客户' : '当前没有待回复客户'}</strong><p>${q ? '试试客户姓名、公司或消息关键词。' : '可切换到全部对话继续查看。'}</p></div>`;
   const count = document.getElementById('reply-filter-count');
   if (count) count.textContent = convList.filter(c => c.needs_reply).length;
 }
@@ -161,6 +161,44 @@ async function loadConversations(el) {
 }
 function filterConversationList(value) { conversationSearch = String(value || ''); renderConversationList(); }
 function showConvList() { document.getElementById('conv-layout')?.classList.remove('chat-open', 'context-open'); }
+const MEDIA_MESSAGE_TYPES = ['image','audio','video','document','sticker','location','contact'];
+function aiPausedUntil(customer) {
+  const raw = customer && customer.ai_paused_until;
+  if (!raw) return null;
+  const until = new Date(String(raw));
+  return Number.isNaN(until.getTime()) || until <= new Date() ? null : until;
+}
+function messageSourceBadge(m) {
+  if (m.direction === 'inbound') {
+    return MEDIA_MESSAGE_TYPES.includes(m.message_type) ? '<span class="msg-badge msg-badge-warn" title="AI 无法识别此类消息，请在手机上查看">需人工查看</span>' : '';
+  }
+  if (m.ai_generated) return '<span class="msg-badge" title="AI 自动生成">AI</span>';
+  if (m.message_type === 'phone' || (m.send_kind === 'manual' && MEDIA_MESSAGE_TYPES.includes(m.message_type))) return '<span class="msg-badge msg-badge-human" title="你在手机上发送">手机</span>';
+  if (m.send_kind === 'manual') return '<span class="msg-badge msg-badge-human" title="在控制台人工发送">人工</span>';
+  if (m.send_kind === 'proactive') return '<span class="msg-badge" title="自动跟进消息">跟进</span>';
+  return '';
+}
+function takeoverBannerHtml(customer) {
+  const until = aiPausedUntil(customer);
+  const id = Number(customer.id);
+  if (until) {
+    return `<div class="takeover-banner active" role="status">${uiIcon('pause')}<span>人工接管中：AI 对该客户暂停至 <strong>${escapeHtml(friendlyDate(customer.ai_paused_until))} ${escapeHtml(timeOnly(customer.ai_paused_until))}</strong>，不会自动回复或主动跟进。</span><button class="btn btn-outline btn-sm" onclick="setCustomerTakeover(${id}, 0)">恢复 AI</button></div>`;
+  }
+  return `<div class="takeover-banner" role="status"><span>AI 托管中。你在手机上回复该客户后会自动转为人工接管。</span><button class="btn btn-ghost btn-sm" onclick="setCustomerTakeover(${id}, 120)">${uiIcon('pause')} 人工接管 2 小时</button></div>`;
+}
+async function setCustomerTakeover(id, minutes) {
+  try {
+    const r = await post(`/customers/${Number(id)}/ai-pause`, {minutes});
+    if (!r || !r.ok) { uiAlert('设置失败：' + ((r && r.error) || '未知错误')); return; }
+    if (activeConversationCustomer && activeConversationCustomer.id === Number(id)) {
+      activeConversationCustomer.ai_paused_until = r.ai_paused_until;
+      const banner = document.getElementById('takeover-banner-slot');
+      if (banner) banner.innerHTML = takeoverBannerHtml(activeConversationCustomer);
+    }
+    const item = convList && convList.find(c => c.id === Number(id));
+    if (item) { item.ai_paused_until = r.ai_paused_until; renderConversationList(); }
+  } catch (error) { uiAlert('设置失败：' + (error.message || String(error))); }
+}
 function renderChatMessages(conversations, customer) {
   if (!conversations.length) return `<div class="chat-empty">${uiIcon('message')}<strong>还没有对话记录</strong><p>可以在下方撰写第一条消息。</p></div>`;
   let lastDay = null;
@@ -170,7 +208,7 @@ function renderChatMessages(conversations, customer) {
     if (day && day !== lastDay) { html = `<div class="date-divider"><span>${friendlyDate(day)}</span></div>`; lastDay = day; }
     const status = m.direction === 'outbound' ? deliveryStatusText(m.status) : '';
     const cls = m.status === 'failed' ? 'text-danger' : ['unknown','pending'].includes(m.status) ? 'text-warn' : '';
-    return html + `<div class="chat-msg-wrap ${m.direction === 'inbound' ? 'inbound' : 'outbound'}">${m.direction === 'inbound' ? avatarHtml(customer.name, customer.phone, 'sm') : ''}<div class="chat-msg ${m.direction === 'inbound' ? 'inbound' : 'outbound'}"><div class="msg-body">${escapeHtml(m.content)}</div><div class="msg-time"><span>${timeOnly(m.sent_at)}</span>${m.ai_generated ? '<span class="msg-badge">AI</span>' : ''}${status ? `<span class="${cls}">${status}</span>` : ''}</div></div></div>`;
+    return html + `<div class="chat-msg-wrap ${m.direction === 'inbound' ? 'inbound' : 'outbound'}">${m.direction === 'inbound' ? avatarHtml(customer.name, customer.phone, 'sm') : ''}<div class="chat-msg ${m.direction === 'inbound' ? 'inbound' : 'outbound'}${MEDIA_MESSAGE_TYPES.includes(m.message_type) ? ' msg-media' : ''}"><div class="msg-body">${escapeHtml(m.content)}</div><div class="msg-time"><span>${timeOnly(m.sent_at)}</span>${messageSourceBadge(m)}${status ? `<span class="${cls}">${status}</span>` : ''}</div></div></div>`;
   }).join('');
 }
 async function selectCustomer(id) {
@@ -199,6 +237,7 @@ async function selectCustomer(id) {
   area.innerHTML = `<div class="chat-header"><div class="chat-contact"><button class="btn btn-ghost btn-icon chat-back" onclick="showConvList()" aria-label="返回客户列表">${uiIcon('chevronLeft')}</button>${avatarHtml(c.name, c.phone, 'lg')}<div><div class="chat-contact-name">${escapeHtml(c.name || formatPhone(c.phone))} ${badgeStatus(c.status)}</div><div class="chat-contact-meta">${escapeHtml(c.company || '未填写公司')} · ${escapeHtml(formatPhone(c.phone))}</div></div></div>
       <div class="chat-header-actions"><button class="btn btn-outline btn-sm" id="context-toggle" aria-expanded="false" onclick="toggleCustomerContext()">${uiIcon('users')} 客户概览</button></div></div>
     ${fs ? `<div class="conversation-reminder">${uiIcon('calendar')}<span>下次跟进 <strong>${friendlyDate(fs.next_followup_at)} ${timeOnly(fs.next_followup_at)}</strong></span><button onclick="navigate('followups')">查看计划 ${uiIcon('chevronRight')}</button></div>` : ''}
+    <div id="takeover-banner-slot">${takeoverBannerHtml(c)}</div>
     <div class="chat-sync-state" id="chat-sync-state" role="status"></div>
     <div class="chat-messages" aria-label="最近 50 条对话记录">${renderChatMessages(d.conversations, c)}</div>
     <div class="chat-input-area"><div class="composer-toolbar"><button class="btn btn-ghost btn-sm" id="reply-template-toggle" aria-expanded="false" onclick="toggleReplyTemplates()">${uiIcon('doc')} 快捷话术</button><span>最近 50 条记录</span></div>
@@ -254,6 +293,12 @@ async function refreshConversationMessages(id, gen) {
     area.innerHTML = renderChatMessages(latest.conversations, latest.customer);
     area.dataset.convSig = sig;
     area.scrollTop = atBottom ? area.scrollHeight : scroll;
+  }
+  if (latest.customer && activeConversationCustomer && activeConversationCustomer.id === Number(id) &&
+      latest.customer.ai_paused_until !== activeConversationCustomer.ai_paused_until) {
+    activeConversationCustomer.ai_paused_until = latest.customer.ai_paused_until;
+    const banner = document.getElementById('takeover-banner-slot');
+    if (banner) banner.innerHTML = takeoverBannerHtml(activeConversationCustomer);
   }
   const sync = document.getElementById('chat-sync-state');
   if (sync) sync.textContent = '';

@@ -312,6 +312,9 @@ def get_connection() -> sqlite3.Connection:
             except sqlite3.Error: pass
             try: conn.execute("ALTER TABLE customers ADD COLUMN email TEXT DEFAULT ''")
             except sqlite3.Error: pass
+            # Per-customer human takeover: AI stays silent for this customer until then.
+            try: conn.execute("ALTER TABLE customers ADD COLUMN ai_paused_until TEXT")
+            except sqlite3.Error: pass
             conn.commit()
             _conns[key] = conn
         return conn
@@ -385,7 +388,8 @@ def save_message(customer_id: int, direction: str, content: str,
                  whatsapp_msg_id: Optional[str] = None, ai_generated: bool = False,
                  status: Optional[str] = None, send_kind: Optional[str] = None,
                  error_message: Optional[str] = None,
-                 dedupe_content_window_seconds: int = 0) -> Optional[int]:
+                 dedupe_content_window_seconds: int = 0,
+                 message_type: str = "text") -> Optional[int]:
     """Persist a message and return its id, or None for a duplicate inbound id.
 
     Outbound rows default to 'pending'; only a bridge receipt may move them to
@@ -423,13 +427,33 @@ def save_message(customer_id: int, direction: str, content: str,
                 return None
         now = datetime.now().isoformat()
         cur = conn.execute(
-            "INSERT INTO conversations(customer_id,direction,content,whatsapp_msg_id,"
+            "INSERT INTO conversations(customer_id,direction,message_type,content,whatsapp_msg_id,"
             "ai_generated,sent_at,status,send_kind,error_message,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (customer_id, direction, content, whatsapp_msg_id, int(ai_generated),
-             now, status, send_kind, error_message, now))
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (customer_id, direction, message_type or "text", content, whatsapp_msg_id,
+             int(ai_generated), now, status, send_kind, error_message, now))
         conn.commit()
     return cur.lastrowid
+
+
+def set_customer_ai_pause(customer_id: int, until: Optional[datetime]) -> Optional[str]:
+    """Pause (until=datetime) or resume (until=None) AI automation for one customer."""
+    value = until.isoformat(timespec="seconds") if until else None
+    with db_write() as conn:
+        conn.execute("UPDATE customers SET ai_paused_until=?, updated_at=? WHERE id=?",
+                     (value, datetime.now().isoformat(), customer_id))
+    return value
+
+
+def customer_ai_paused(customer: Optional[dict], now: Optional[datetime] = None) -> bool:
+    """True while a human has taken over this customer's conversation."""
+    raw = (customer or {}).get("ai_paused_until")
+    if not raw:
+        return False
+    try:
+        return datetime.fromisoformat(str(raw)) > (now or datetime.now())
+    except (TypeError, ValueError):
+        return False
 
 
 def get_message(conversation_id: int) -> Optional[dict]:
@@ -632,7 +656,7 @@ def get_recent_conversations(customer_id: int, limit: int = 20) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM conversations WHERE customer_id=? "
         "AND status IN ('received','sent') "
-        "ORDER BY sent_at DESC LIMIT ?",
+        "ORDER BY sent_at DESC, id DESC LIMIT ?",
         (customer_id, limit)).fetchall()
     return [dict(r) for r in reversed(rows)]
 

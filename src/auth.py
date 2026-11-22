@@ -8,6 +8,7 @@ contextvar，后续所有 ``get_config()`` / ``get_connection()`` 都会落到�
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import secrets
@@ -48,12 +49,24 @@ _locked_until: Dict[Tuple[str, str], float] = {}
 
 
 def _client_ip(request: Request) -> str:
+    """Best-effort real client IP for rate limiting.
+
+    Only proxy headers from a trusted hop are considered. ``CF-Connecting-IP``
+    is set by Cloudflare and cannot be supplied by the client. For
+    ``X-Forwarded-For`` the *rightmost* entry is used: it was appended by the
+    nearest proxy, while leftmost entries are whatever the client sent (taking
+    the first one let attackers rotate fake IPs and bypass the login lockout).
+    """
     peer = request.client.host if request.client else ""
     trust_proxy = os.getenv("WA_TRUST_PROXY", "") in ("1", "true", "yes")
     if trust_proxy or peer in ("127.0.0.1", "::1", "localhost"):
+        cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+        if cf_ip:
+            return cf_ip
         fwd = request.headers.get("x-forwarded-for", "")
-        if fwd:
-            return fwd.split(",")[0].strip()
+        hops = [h.strip() for h in fwd.split(",") if h.strip()]
+        if hops:
+            return hops[-1]
     return peer
 
 
@@ -214,7 +227,8 @@ async def register(request: Request):
     email = (body.get("email") or "").strip()
     password = body.get("password") or ""
 
-    if _SIGNUP_CODE and (body.get("code") or "").strip() != _SIGNUP_CODE:
+    if _SIGNUP_CODE and not hmac.compare_digest(
+            (body.get("code") or "").strip().encode("utf-8"), _SIGNUP_CODE.encode("utf-8")):
         return JSONResponse({"error": "邀请码不正确"}, status_code=403)
 
     # 先校验邮箱格式，避免建了目录才发现重名

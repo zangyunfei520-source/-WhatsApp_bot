@@ -381,7 +381,8 @@ function autoBatchReasonLabel(code) {
     customer_opted_out: '客户已退订',
     customer_blocked: '客户已拉黑',
     customer_inactive: '客户已标记为不活跃',
-    no_phone: '客户缺少电话号码'
+    no_phone: '客户缺少电话号码',
+    human_takeover: '该客户已由人工接管'
   };
   return labels[code] || code;
 }

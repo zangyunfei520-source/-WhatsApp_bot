@@ -13,8 +13,10 @@ services:
       TZ: Asia/Shanghai
       # 公网访问域名（经 Cloudflare Tunnel / 反向代理接入时用于同源校验）
       WA_PUBLIC_ORIGIN: "https://bot.xueai88.xyz"
-      # 关闭自助注册时改成 0
-      WA_ALLOW_SIGNUP: "1"
+      # 公网默认关闭自助注册：开放注册意味着任何人都能开租户、起 bridge 进程，
+      # 并可能用到下方的平台级 LLM Key。需要开放时改成 1，并务必同时设置邀请码。
+      WA_ALLOW_SIGNUP: "0"
+      # WA_SIGNUP_CODE: "换成你自己的邀请码"
       # 平台级默认 LLM Key（用户可在自己的 data/.env 里覆盖）
       # LLM_API_KEY: "sk-..."
     logging:

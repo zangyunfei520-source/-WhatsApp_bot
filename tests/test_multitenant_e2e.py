@@ -63,7 +63,12 @@ out["other_customers"] = other.get("/admin/api/customers").json()["total"]
 
 # 4) 二维码按租户归属
 other_id = out["other_me"]["user_id"]
-anon.post("/webhook/qr", json={"qr_text": "2@OTHER"}, headers={"X-Tenant-Id": other_id})
+import bridge_manager
+out["forged_qr"] = anon.post("/webhook/qr", json={"qr_text": "2@FORGED"},
+                             headers={"X-Tenant-Id": other_id}).status_code
+bridge_manager._tokens[other_id] = "e2e-bridge-token"
+anon.post("/webhook/qr", json={"qr_text": "2@OTHER"},
+          headers={"X-Tenant-Id": other_id, "X-Bridge-Token": "e2e-bridge-token"})
 out["other_qr"] = other.get("/admin/api/qr").json()
 out["admin_qr"] = admin.get("/admin/api/qr").json()
 
@@ -103,6 +108,7 @@ class MultiTenantEndToEndTest(unittest.TestCase):
             self.assertEqual(out["admin_customers"], 1, "管理员应看到自己的客户")
             self.assertEqual(out["other_customers"], 0, "第二个用户不应看到别人的客户")
 
+            self.assertEqual(out["forged_qr"], 403, "未签发 token 的租户 webhook 必须拒绝")
             self.assertEqual(out["other_qr"]["qr_text"], "2@OTHER")
             self.assertEqual(out["admin_qr"]["status"], "none", "二维码不能串租户")
 

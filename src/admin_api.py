@@ -16,7 +16,10 @@ import io
 import openpyxl
 
 logger = logging.getLogger(__name__)
+from typing import Optional
+
 from fastapi import APIRouter, File, Query, UploadFile
+from fastapi.responses import JSONResponse
 
 from config import get_config, get_data_dir
 from database import (
@@ -65,9 +68,13 @@ async def setup_status():
 @router.post("/setup")
 async def save_setup(data: dict):
     """Save initial configuration (API key)."""
-    api_key = data.get("api_key", "").strip()
+    api_key = str(data.get("api_key") or "").strip()
     if not api_key:
         return {"error": "api_key required"}
+    # The key is written verbatim into a KEY=VALUE .env file; a newline would
+    # let the value inject extra settings, and quotes/whitespace break parsing.
+    if len(api_key) > 512 or any(ch.isspace() or ch in "\"'" or ord(ch) < 32 for ch in api_key):
+        return {"error": "api_key contains invalid characters"}
 
     data_dir = get_data_dir()
     env_path = data_dir / ".env"
@@ -325,6 +332,25 @@ async def customer_detail(customer_id: int):
     }
 
 
+@router.post("/customers/{customer_id}/ai-pause")
+async def set_customer_ai_takeover(customer_id: int, data: dict):
+    """人工接管某个客户：minutes>0 暂停该客户的 AI 自动回复与主动跟进；minutes=0 恢复。"""
+    from datetime import timedelta
+    from database import set_customer_ai_pause
+    try:
+        minutes = int(data.get("minutes", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "minutes must be an integer"}, status_code=400)
+    if minutes < 0 or minutes > 60 * 24 * 365:
+        return JSONResponse({"error": "minutes out of range"}, status_code=400)
+    row = get_connection().execute("SELECT id FROM customers WHERE id=?", (customer_id,)).fetchone()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    until = datetime.now() + timedelta(minutes=minutes) if minutes else None
+    value = await asyncio.to_thread(set_customer_ai_pause, customer_id, until)
+    return {"ok": True, "ai_paused_until": value}
+
+
 @router.post("/customers/{customer_id}/status")
 async def update_customer_status(customer_id: int, data: dict):
     allowed = {"status", "notes", "tags", "name", "company", "phone", "email"}
@@ -542,8 +568,8 @@ def _import_customers_sync(filename: str, raw_bytes: bytes) -> dict:
 @router.post("/customers/import")
 async def import_customers(file: UploadFile = File(...)):
     filename = file.filename or ""
-    raw_bytes = await file.read()
-    if len(raw_bytes) > 20 * 1024 * 1024:
+    raw_bytes = await _read_limited(file, 20 * 1024 * 1024)
+    if raw_bytes is None:
         return {"error": "导入文件过大（最大 20MB）"}
     return await asyncio.to_thread(_import_customers_sync, filename, raw_bytes)
 
@@ -1100,14 +1126,44 @@ def _process_uploaded_docs_sync(file_items: list[tuple[str, bytes]]) -> dict:
     return {"imported": imported, "failed": failed}
 
 
+_MAX_UPLOAD_FILES = 20
+
+
+async def _read_limited(file: UploadFile, limit: int) -> Optional[bytes]:
+    """Read an upload in chunks; return None as soon as it exceeds ``limit``.
+
+    Reading the whole body first and checking afterwards let a single request
+    pin arbitrarily large files in memory.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/product-docs/upload")
 async def upload_product_docs(files: list[UploadFile] = File(...)):
+    if len(files) > _MAX_UPLOAD_FILES:
+        return JSONResponse({"error": f"一次最多上传 {_MAX_UPLOAD_FILES} 个文件"}, status_code=400)
     file_items: list[tuple[str, bytes]] = []
+    too_large: list[dict] = []
     for file in files:
         filename = file.filename or "untitled"
-        content_bytes = await file.read()
+        content_bytes = await _read_limited(file, _MAX_DOC_BYTES)
+        if content_bytes is None:
+            too_large.append({"filename": filename, "reason": "文件过大（最大 50MB）"})
+            continue
         file_items.append((filename, content_bytes))
-    return await asyncio.to_thread(_process_uploaded_docs_sync, file_items)
+    result = await asyncio.to_thread(_process_uploaded_docs_sync, file_items)
+    result["failed"] = too_large + result.get("failed", [])
+    return result
 
 
 # ── QR Code ────────────────────────────────────────────────────────────────────

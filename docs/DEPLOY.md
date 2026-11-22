@@ -102,7 +102,10 @@ Cloudflare Zero Trust → Access → Applications → Add：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `WA_ALLOW_SIGNUP` | `1` | 设为 `0` 关闭自助注册，只允许管理员建号 |
+| `WA_ALLOW_SIGNUP` | 代码默认 `1`；`docker-compose.yml` 里为 `0` | 设为 `0` 关闭自助注册，只允许管理员建号。公网部署请保持关闭，或配合 `WA_SIGNUP_CODE` |
+| `WA_SIGNUP_CODE` | 空 | 设置后注册必须填写邀请码 |
+| `WA_WEBHOOK_SECRET` | 空 | 可选：所有 bridge 回调共用的密钥；不设时按租户自动签发 token，未签发 token 的租户回调一律拒绝 |
+| `WA_TRUST_PROXY` | 空 | 设为 `1` 时信任反向代理传来的 `CF-Connecting-IP` / `X-Forwarded-For`（用于登录限流） |
 | `LLM_API_KEY` | 空 | 平台级默认 Key；用户可在自己 `data/.env` 覆盖 |
 | `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | 监听地址 |
 | `BRIDGE_PORT` | `3001` | 单租户回退端口；多租户由 `bridge_manager` 分配 3101+ |
@@ -147,7 +150,7 @@ WA_SIGNUP_CODE=XUEAI-7K3P
 ```
 
 登录页会在「创建账号」标签下自动出现邀请码输入框；不填或填错返回 403。
-留空则退回开放注册（默认行为）。
+留空且 `WA_ALLOW_SIGNUP=1` 时为开放注册；`docker-compose.yml` 默认已关闭注册。
 
 ## 5.7 关闭注册后如何加人
 

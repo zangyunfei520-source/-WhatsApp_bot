@@ -63,6 +63,7 @@ _REASON_MESSAGES = {
     "customer_blocked": "客户已拉黑",
     "customer_inactive": "客户已标记为不活跃",
     "customer_status": "客户联系状态不允许主动跟进",
+    "human_takeover": "该客户已由人工接管，AI 暂停中",
 }
 
 
@@ -101,6 +102,10 @@ def check_proactive_eligibility(customer: dict, schedule: Optional[dict], *,
         blockers.append(_blocker(f"customer_{status}"))
     elif status != "active":
         blockers.append(_blocker("customer_status"))
+
+    from database import customer_ai_paused
+    if customer_ai_paused(customer, now):
+        blockers.append(_blocker("human_takeover"))
 
     phone = (customer or {}).get("phone") or ""
     if not phone.strip():

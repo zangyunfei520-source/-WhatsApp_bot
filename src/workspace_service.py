@@ -18,9 +18,10 @@ WITH messages AS (
     SELECT customer_id, MIN(next_followup_at) AS next_followup_at
     FROM follow_up_schedule WHERE active=1 GROUP BY customer_id
 )
-SELECT c.id, c.name, c.phone, c.company, c.status,
+SELECT c.id, c.name, c.phone, c.company, c.status, c.ai_paused_until,
        m.id AS last_message_id, m.sent_at AS last_msg, m.content AS last_content,
        m.direction AS last_direction, m.status AS last_status,
+       m.message_type AS last_message_type, m.ai_generated AS last_ai_generated,
        (SELECT COUNT(*) FROM conversations WHERE customer_id=c.id) AS msg_count,
        CASE WHEN r.direction='inbound' AND c.status='active' THEN 1 ELSE 0 END AS needs_reply,
        s.next_followup_at, ls.score, ls.segment, ls.last_scored_at

@@ -391,7 +391,19 @@ def generate_reply(customer: dict, incoming_message: str) -> str:
             {"role": "system", "content": _build_system_prompt(customer)},
             {"role": "system", "content": _build_specs_message()},
         ]
-        messages.extend(_build_chat_messages(customer["id"], 10))
+        history = _build_chat_messages(customer["id"], 10)
+        # The current inbound message(s) are already stored, so they show up as
+        # trailing "user" turns in the history. Fold them into the final user
+        # message instead of sending them twice, and keep earlier unanswered
+        # messages (e.g. "hi" followed by the real question) in the prompt.
+        pending: list[str] = []
+        while history and history[-1]["role"] == "user":
+            pending.insert(0, history.pop()["content"])
+        messages.extend(history)
+        current = (incoming_message or "").strip()
+        if current and not any(current == p.strip() for p in pending) and current not in "\n".join(pending):
+            pending.append(current)
+        user_content = "\n".join(p for p in pending if p and p.strip()) or incoming_message
 
         # Explicit language instruction prevents the AI from defaulting to
         # Chinese when the incoming message is short or ambiguous.
@@ -408,7 +420,7 @@ def generate_reply(customer: dict, incoming_message: str) -> str:
                 "content": "IMPORTANT: Default to English for this reply."
             })
 
-        messages.append({"role": "user", "content": incoming_message})
+        messages.append({"role": "user", "content": user_content})
         resp = client.chat.completions.create(model=cfg.ai.model, max_tokens=800, messages=messages)
         reply = _clean_reply(resp.choices[0].message.content)
         if len(reply) > cfg.ai.reply_max_length:

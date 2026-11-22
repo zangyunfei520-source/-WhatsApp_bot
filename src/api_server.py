@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
@@ -93,6 +93,20 @@ class IncomingMessage(BaseModel):
     body: str
     msg_id: Optional[str] = None
     timestamp: Optional[str] = None
+    # text | image | audio | video | document | sticker | location | contact
+    message_type: str = "text"
+    # Bridge batching: store now, the last message of the batch triggers the reply.
+    defer_reply: bool = False
+    batch_text: Optional[str] = None
+
+
+class OutgoingMessage(BaseModel):
+    """A message the salesperson sent from the phone / another linked device."""
+    to: str
+    body: str
+    msg_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    message_type: str = "text"
 
 
 class DeliveryReceipt(BaseModel):
@@ -151,14 +165,39 @@ async def receive_message(msg: IncomingMessage, request: Request):
     if err is not None:
         return err
     try:
-        logger.info(f"[inbound] from={msg.from_} body={msg.body[:80]}")
+        logger.info("[inbound] from=%s type=%s len=%d", msg.from_, msg.message_type, len(msg.body))
         if _message_handler is None:
             return {"action": "ignore", "reason": "no handler"}
         try:
-            return await _message_handler(msg.from_, msg.body, msg.msg_id)
+            return await _message_handler(
+                msg.from_, msg.body, msg.msg_id,
+                message_type=msg.message_type,
+                defer_reply=msg.defer_reply,
+                batch_text=msg.batch_text,
+            )
         except Exception as e:
             logger.error(f"Message handler error: {e}", exc_info=True)
             return {"action": "ignore", "reason": "error"}
+    finally:
+        if token is not None:
+            import tenancy
+            tenancy.reset_current(token)
+
+
+@app.post("/webhook/outgoing")
+async def receive_outgoing(msg: OutgoingMessage, request: Request):
+    """Human reply sent from the phone: record it and pause AI for that customer."""
+    token, err = _bind_tenant(request)
+    if err is not None:
+        return err
+    try:
+        from message_router import handle_outgoing_from_phone
+        result = await handle_outgoing_from_phone(msg.to, msg.body, msg.msg_id, msg.message_type)
+        logger.info("[outgoing] to=%s stored=%s", msg.to, result.get("stored"))
+        return result
+    except Exception as e:
+        logger.error(f"Outgoing handler error: {e}", exc_info=True)
+        return {"stored": False, "reason": "error"}
     finally:
         if token is not None:
             import tenancy
@@ -229,7 +268,8 @@ async def health():
         return {"status": "ok"}
     except Exception as exc:
         logger.warning("Health probe degraded: %s", exc)
-        return JSONResponse({"status": "degraded", "error": str(exc)}, status_code=503)
+        # Do not leak internal paths / exception text to unauthenticated callers.
+        return JSONResponse({"status": "degraded"}, status_code=503)
 
 
 def _admin_html_path() -> Path:

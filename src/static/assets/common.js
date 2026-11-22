@@ -131,12 +131,20 @@ function uiIcon(name, cls) {
 }
 
 function initials(name, phone) {
-  const raw = (name || '').trim();
-  if (raw && raw !== (phone || '')) {
+  // Drop bracketed notes such as "林晓（测试）" / "John (Acme)" and punctuation
+  // before picking letters, otherwise the avatar showed "试）".
+  const raw = String(name || '')
+    .replace(/[（(【\[{<《][^）)】\]}>》]*[）)】\]}>》]?/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .trim();
+  if (raw && /\p{L}/u.test(raw)) {
+    if (/[\u3400-\u9fff]/.test(raw)) {
+      const han = raw.replace(/[^\u3400-\u9fff]/g, '');
+      if (han) return han.length > 2 ? han.slice(-2) : han;
+    }
     const parts = raw.split(/\s+/).filter(Boolean);
-    if (parts.length > 1) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-    if (/[\u4e00-\u9fff]/.test(raw)) return raw.length > 1 ? raw.slice(-2) : raw;
-    return raw.slice(0, 2).toUpperCase();
+    if (parts.length > 1) return (Array.from(parts[0])[0] + Array.from(parts[parts.length - 1])[0]).toUpperCase();
+    return Array.from(raw).slice(0, 2).join('').toUpperCase();
   }
   const digits = String(phone || '').replace(/\D/g, '');
   return digits ? digits.slice(-2) : '?';

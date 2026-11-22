@@ -93,6 +93,8 @@ class BusinessConfig(BaseModel):
     max_auto_replies_per_hour: int = 30
     max_auto_replies_per_day: int = 40
     min_delay_between_messages_seconds: int = 60
+    # 你在手机上亲自回复某个客户后，AI 对该客户暂停自动回复/主动跟进的时长（分钟）。0 表示不自动暂停。
+    human_takeover_minutes: int = 120
 
 
 class AIConfig(BaseModel):
