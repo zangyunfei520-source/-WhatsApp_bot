@@ -24,7 +24,9 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          npm --prefix bridge ci --omit=dev --no-audit --no-fund
 
       - name: Unit tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
